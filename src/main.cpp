@@ -29,6 +29,8 @@
 #include <esp_now.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "smart_home_json.h"
 #include "smart_home_protocol.h"
@@ -45,6 +47,7 @@ constexpr int BUZZER_PIN          = 25; // Siren buzzer output (LEDC tone)
 constexpr int GATE_SERVO_1_PIN    = 18; // Left car gate servo
 constexpr int GATE_SERVO_2_PIN    = 19; // Right car gate servo
 constexpr int DOOR_SERVO_3_PIN    = 26; // Pedestrian door servo
+constexpr int LIGHT_PIN           = 4;  // Smart Light transistor driver (digital OUT)
 
 // ---------------------------------------------------------------------------
 // Servos & PWM Configuration
@@ -114,6 +117,11 @@ struct HubConfig {
   bool motionTriggersSiren = true;  // Trigger buzzer on PIR motion
   bool ultraTriggersSiren  = true;  // Trigger buzzer on ultrasonic proximity
   bool sirenMuted          = false; // Global siren mute switch
+  bool pirScheduleEnabled  = true;  // Filter PIR siren by night window (midnight to 7 AM)
+  int pirStartHour         = 0;     // Midnight (00:00)
+  int pirStartMin          = 0;
+  int pirEndHour           = 7;     // 7:00 AM (07:00)
+  int pirEndMin            = 0;
   char staSsid[33]         = "";    // Optional Home Wi-Fi SSID
   char staPass[65]         = "";    // Optional Home Wi-Fi Password
 };
@@ -210,6 +218,68 @@ bool lastMotionDetected = false;
 bool lastAlarmActive = false;
 unsigned long lastPrintMs = 0;
 
+bool lightState = false;
+bool timeSynchronized = false;
+
+// ---------------------------------------------------------------------------
+// Timekeeping & Smart Lighting Helpers
+// ---------------------------------------------------------------------------
+void initDefaultSystemTime() {
+  struct tm tmBoot = {};
+  tmBoot.tm_year = 2026 - 1900;
+  tmBoot.tm_mon  = 0;  // January
+  tmBoot.tm_mday = 1;
+  tmBoot.tm_hour = 12; // 12:00 PM default as requested
+  tmBoot.tm_min  = 0;
+  tmBoot.tm_sec  = 0;
+  time_t bootEpoch = mktime(&tmBoot);
+  struct timeval tvBoot = { .tv_sec = bootEpoch, .tv_usec = 0 };
+  settimeofday(&tvBoot, nullptr);
+  timeSynchronized = false;
+}
+
+void setSystemEpochTime(uint32_t epochSec) {
+  struct timeval tv = { .tv_sec = static_cast<time_t>(epochSec), .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  timeSynchronized = true;
+
+  char timeBuf[32];
+  time_t nowTime = time(nullptr);
+  struct tm ti;
+  localtime_r(&nowTime, &ti);
+  strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &ti);
+  char msg[72];
+  snprintf(msg, sizeof(msg), "System clock updated to %s", timeBuf);
+  addEventLog("info", msg);
+}
+
+bool isPirScheduleActive() {
+  time_t now = time(nullptr);
+  struct tm ti;
+  localtime_r(&now, &ti);
+  int curMinutes = ti.tm_hour * 60 + ti.tm_min;
+  int startMinutes = g_cfg.pirStartHour * 60 + g_cfg.pirStartMin;
+  int endMinutes = g_cfg.pirEndHour * 60 + g_cfg.pirEndMin;
+
+  if (startMinutes == endMinutes) {
+    return true; // 24-hr active
+  }
+  if (startMinutes < endMinutes) {
+    // Same-day window, e.g. 00:00 (0m) to 07:00 (420m)
+    return (curMinutes >= startMinutes && curMinutes < endMinutes);
+  } else {
+    // Overnight wrap-around window, e.g. 23:00 to 07:00
+    return (curMinutes >= startMinutes || curMinutes < endMinutes);
+  }
+}
+
+void setLightState(bool on) {
+  if (lightState == on) return;
+  lightState = on;
+  digitalWrite(LIGHT_PIN, lightState ? HIGH : LOW);
+  addEventLog("info", lightState ? "Smart Light turned ON (GPIO4)" : "Smart Light turned OFF (GPIO4)");
+}
+
 // Non-blocking interrupt-driven HC-SR04 state
 portMUX_TYPE echoMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int64_t echoRiseUs = 0;
@@ -264,6 +334,11 @@ void loadConfigFromNvs() {
   g_cfg.motionTriggersSiren  = prefs.getBool("mot_siren", true);
   g_cfg.ultraTriggersSiren   = prefs.getBool("ult_siren", true);
   g_cfg.sirenMuted           = prefs.getBool("muted", false);
+  g_cfg.pirScheduleEnabled  = prefs.getBool("pir_sched", true);
+  g_cfg.pirStartHour         = prefs.getInt("pir_sh", 0);
+  g_cfg.pirStartMin          = prefs.getInt("pir_sm", 0);
+  g_cfg.pirEndHour           = prefs.getInt("pir_eh", 7);
+  g_cfg.pirEndMin            = prefs.getInt("pir_em", 0);
 
   String savedSsid = prefs.getString("sta_ssid", "");
   String savedPass = prefs.getString("sta_pass", "");
@@ -279,6 +354,10 @@ void loadConfigFromNvs() {
   g_cfg.gateHoldMs = constrain(g_cfg.gateHoldMs, 1000UL, 30000UL);
   g_cfg.doorHoldMs = constrain(g_cfg.doorHoldMs, 1000UL, 30000UL);
   g_cfg.camAlarmMs = constrain(g_cfg.camAlarmMs, 1000UL, 20000UL);
+  g_cfg.pirStartHour = constrain(g_cfg.pirStartHour, 0, 23);
+  g_cfg.pirStartMin = constrain(g_cfg.pirStartMin, 0, 59);
+  g_cfg.pirEndHour = constrain(g_cfg.pirEndHour, 0, 23);
+  g_cfg.pirEndMin = constrain(g_cfg.pirEndMin, 0, 59);
 }
 
 void saveConfigToNvs() {
@@ -292,6 +371,11 @@ void saveConfigToNvs() {
   prefs.putBool("mot_siren", g_cfg.motionTriggersSiren);
   prefs.putBool("ult_siren", g_cfg.ultraTriggersSiren);
   prefs.putBool("muted", g_cfg.sirenMuted);
+  prefs.putBool("pir_sched", g_cfg.pirScheduleEnabled);
+  prefs.putInt("pir_sh", g_cfg.pirStartHour);
+  prefs.putInt("pir_sm", g_cfg.pirStartMin);
+  prefs.putInt("pir_eh", g_cfg.pirEndHour);
+  prefs.putInt("pir_em", g_cfg.pirEndMin);
   prefs.putString("sta_ssid", g_cfg.staSsid);
   prefs.putString("sta_pass", g_cfg.staPass);
   prefs.end();
@@ -772,6 +856,15 @@ void handleApiStatus() {
   bool faceOnline = faceCamState.seen && (now - faceCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
   bool plateOnline = plateCamState.seen && (now - plateCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
 
+  time_t nowClock = time(nullptr);
+  struct tm ti;
+  localtime_r(&nowClock, &ti);
+  char clockStr[32];
+  strftime(clockStr, sizeof(clockStr), "%Y-%m-%d %H:%M:%S", &ti);
+  char timeOnly[16];
+  strftime(timeOnly, sizeof(timeOnly), "%H:%M:%S", &ti);
+  bool pirSchedActive = g_cfg.pirScheduleEnabled ? isPirScheduleActive() : true;
+
   uint32_t droppedSnapshot = 0;
   portENTER_CRITICAL(&rxMux);
   droppedSnapshot = rxDropped;
@@ -784,6 +877,18 @@ void handleApiStatus() {
   json += "\"uptimeSec\":" + String(now / 1000) + ",";
   json += "\"uptimeStr\":\"" + String(uptimeBuf) + "\",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+
+  // System Time & Smart Light
+  json += "\"lightState\":" + String(lightState ? "true" : "false") + ",";
+  json += "\"pirSchedActive\":" + String(pirSchedActive ? "true" : "false") + ",";
+  json += "\"time\":{";
+  json += "\"clock\":\"" + String(clockStr) + "\",";
+  json += "\"timeOnly\":\"" + String(timeOnly) + "\",";
+  json += "\"epoch\":" + String(nowClock) + ",";
+  json += "\"hour\":" + String(ti.tm_hour) + ",";
+  json += "\"min\":" + String(ti.tm_min) + ",";
+  json += "\"synced\":" + String(timeSynchronized ? "true" : "false");
+  json += "},";
 
   // Safety sensors
   json += "\"flameAdc\":" + String(lastFlameAdc) + ",";
@@ -852,7 +957,12 @@ void handleApiStatus() {
   json += "\"doorMs\":" + String(g_cfg.doorHoldMs) + ",";
   json += "\"camMs\":" + String(g_cfg.camAlarmMs) + ",";
   json += "\"motSiren\":" + String(g_cfg.motionTriggersSiren ? "true" : "false") + ",";
-  json += "\"ultSiren\":" + String(g_cfg.ultraTriggersSiren ? "true" : "false");
+  json += "\"ultSiren\":" + String(g_cfg.ultraTriggersSiren ? "true" : "false") + ",";
+  json += "\"pirSched\":" + String(g_cfg.pirScheduleEnabled ? "true" : "false") + ",";
+  json += "\"pirSH\":" + String(g_cfg.pirStartHour) + ",";
+  json += "\"pirSM\":" + String(g_cfg.pirStartMin) + ",";
+  json += "\"pirEH\":" + String(g_cfg.pirEndHour) + ",";
+  json += "\"pirEM\":" + String(g_cfg.pirEndMin);
   json += "},";
 
   // Event log items
@@ -920,6 +1030,12 @@ void handleApiControl() {
       addEventLog("info", "Siren buzzer UNMUTED by user");
     }
     saveConfigToNvs();
+  } else if (action == "light_on") {
+    setLightState(true);
+  } else if (action == "light_off") {
+    setLightState(false);
+  } else if (action == "light_toggle") {
+    setLightState(!lightState);
   } else {
     server.send(400, "application/json", "{\"error\":\"unknown action\"}");
     return;
@@ -929,17 +1045,59 @@ void handleApiControl() {
 }
 
 // ---------------------------------------------------------------------------
+// Web API: Set System Clock (/api/time)
+// ---------------------------------------------------------------------------
+void handleApiTime() {
+  if (server.hasArg("epoch")) {
+    int64_t ep = atoll(server.arg("epoch").c_str());
+    if (server.hasArg("tz_offset")) {
+      ep += server.arg("tz_offset").toInt();
+    }
+    setSystemEpochTime(static_cast<uint32_t>(ep));
+    server.send(200, "application/json", "{\"ok\":true,\"synced\":true}");
+    return;
+  }
+  if (server.hasArg("hour") && server.hasArg("min")) {
+    time_t now = time(nullptr);
+    struct tm ti;
+    localtime_r(&now, &ti);
+    ti.tm_hour = constrain(server.arg("hour").toInt(), 0, 23);
+    ti.tm_min  = constrain(server.arg("min").toInt(), 0, 59);
+    ti.tm_sec  = server.hasArg("sec") ? constrain(server.arg("sec").toInt(), 0, 59) : 0;
+    if (server.hasArg("year")) {
+      ti.tm_year = constrain(server.arg("year").toInt() - 1900, 70, 200);
+    }
+    if (server.hasArg("mon")) {
+      ti.tm_mon = constrain(server.arg("mon").toInt() - 1, 0, 11);
+    }
+    if (server.hasArg("mday")) {
+      ti.tm_mday = constrain(server.arg("mday").toInt(), 1, 31);
+    }
+    time_t newEpoch = mktime(&ti);
+    setSystemEpochTime(static_cast<uint32_t>(newEpoch));
+    server.send(200, "application/json", "{\"ok\":true,\"synced\":true}");
+    return;
+  }
+  server.send(400, "application/json", "{\"error\":\"missing epoch or time parameters\"}");
+}
+
+// ---------------------------------------------------------------------------
 // Web API: Update Settings (/api/config)
 // ---------------------------------------------------------------------------
 void handleApiConfig() {
-  if (server.hasArg("fire_th"))  g_cfg.fireThreshold = constrain(server.arg("fire_th").toInt(), 100, 3900);
-  if (server.hasArg("smoke_th")) g_cfg.smokeThreshold = constrain(server.arg("smoke_th").toInt(), 200, 4000);
-  if (server.hasArg("ultra_cm")) g_cfg.ultrasonicDistCm = constrain(server.arg("ultra_cm").toFloat(), 5.0f, 150.0f);
-  if (server.hasArg("gate_ms"))  g_cfg.gateHoldMs = constrain(server.arg("gate_ms").toInt(), 1000, 30000);
-  if (server.hasArg("door_ms"))  g_cfg.doorHoldMs = constrain(server.arg("door_ms").toInt(), 1000, 30000);
-  if (server.hasArg("cam_ms"))   g_cfg.camAlarmMs = constrain(server.arg("cam_ms").toInt(), 1000, 20000);
+  if (server.hasArg("fire_th"))   g_cfg.fireThreshold = constrain(server.arg("fire_th").toInt(), 100, 3900);
+  if (server.hasArg("smoke_th"))  g_cfg.smokeThreshold = constrain(server.arg("smoke_th").toInt(), 200, 4000);
+  if (server.hasArg("ultra_cm"))  g_cfg.ultrasonicDistCm = constrain(server.arg("ultra_cm").toFloat(), 5.0f, 150.0f);
+  if (server.hasArg("gate_ms"))   g_cfg.gateHoldMs = constrain(server.arg("gate_ms").toInt(), 1000, 30000);
+  if (server.hasArg("door_ms"))   g_cfg.doorHoldMs = constrain(server.arg("door_ms").toInt(), 1000, 30000);
+  if (server.hasArg("cam_ms"))    g_cfg.camAlarmMs = constrain(server.arg("cam_ms").toInt(), 1000, 20000);
   if (server.hasArg("mot_siren")) g_cfg.motionTriggersSiren = (server.arg("mot_siren").toInt() != 0);
   if (server.hasArg("ult_siren")) g_cfg.ultraTriggersSiren = (server.arg("ult_siren").toInt() != 0);
+  if (server.hasArg("pir_sched")) g_cfg.pirScheduleEnabled = (server.arg("pir_sched").toInt() != 0);
+  if (server.hasArg("pir_sh"))    g_cfg.pirStartHour = constrain(server.arg("pir_sh").toInt(), 0, 23);
+  if (server.hasArg("pir_sm"))    g_cfg.pirStartMin  = constrain(server.arg("pir_sm").toInt(), 0, 59);
+  if (server.hasArg("pir_eh"))    g_cfg.pirEndHour   = constrain(server.arg("pir_eh").toInt(), 0, 23);
+  if (server.hasArg("pir_em"))    g_cfg.pirEndMin    = constrain(server.arg("pir_em").toInt(), 0, 59);
 
   saveConfigToNvs();
   addEventLog("info", "System settings updated and saved to NVS");
@@ -1088,6 +1246,8 @@ void handleRoot() {
       </div>
     </div>
     <div class="h-status">
+      <span id="sysClockBadge" class="badge b-warn" style="font-family:monospace;font-size:.8rem">12:00:00 PM</span>
+      <button class="secondary" style="font-size:.76rem;padding:4px 8px" onclick="syncBrowserTime()" title="Sync clock with browser">⏱️ Sync Time</button>
       <span id="badgeAlarm" class="badge b-ok">SYSTEM NORMAL</span>
       <span id="badgeMute" class="badge b-off">SIREN ARMED</span>
       <button id="btnMute" class="secondary" onclick="toggleMute()">Mute Siren</button>
@@ -1176,8 +1336,9 @@ void handleRoot() {
         <span id="pirBadge" class="badge b-ok">CLEAR</span>
       </div>
       <div class="row"><span class="k">Motion State</span><span id="pirVal" class="v">No Motion</span></div>
-      <div class="row"><span class="k">Siren Response</span><span id="pirCfgText" class="v">Enabled</span></div>
-      <div style="font-size:.82rem;color:var(--muted);margin-top:6px">Active-HIGH digital infrared sensor</div>
+      <div class="row"><span class="k">Siren Guard Window</span><span id="pirWindowText" class="v">00:00 - 07:00</span></div>
+      <div class="row"><span class="k">Night Siren Guard</span><span id="pirGuardBadge" class="badge b-off">QUIET HOURS</span></div>
+      <div style="font-size:.82rem;color:var(--muted);margin-top:6px">Active-HIGH sensor; alarm armed midnight-7am</div>
     </div>
 
     <!-- Ultrasonic Proximity -->
@@ -1194,6 +1355,21 @@ void handleRoot() {
 
   <!-- Actuators & Hardware State -->
   <div class="grid">
+    <!-- Smart Lighting (GPIO4) -->
+    <div class="card">
+      <div class="card-title">
+        <span>💡 Smart Lighting</span>
+        <span id="lightBadge" class="badge b-off">LIGHT OFF</span>
+      </div>
+      <div class="row"><span class="k">Output Control</span><span class="v">GPIO 4 (Transistor Drive)</span></div>
+      <div class="row"><span class="k">Current State</span><span id="lightStateText" class="v">OFF (0V)</span></div>
+      <div class="cam-actions" style="margin-top:10px">
+        <button id="btnLightToggle" onclick="triggerAction('light_toggle')">Toggle Light</button>
+        <button class="secondary" onclick="triggerAction('light_on')">Turn ON</button>
+        <button class="secondary" onclick="triggerAction('light_off')">Turn OFF</button>
+      </div>
+    </div>
+
     <!-- Servos State -->
     <div class="card">
       <div class="card-title">Servos &amp; Barriers</div>
@@ -1213,6 +1389,7 @@ void handleRoot() {
     <!-- Hub Health -->
     <div class="card">
       <div class="card-title">System Diagnostics</div>
+      <div class="row"><span class="k">System Clock</span><span id="sysClockText" class="v">12:00:00 PM</span></div>
       <div class="row"><span class="k">System Uptime</span><span id="sysUptime" class="v">00:00:00</span></div>
       <div class="row"><span class="k">Free Heap Memory</span><span id="sysHeap" class="v">-- KB</span></div>
       <div class="row"><span class="k">ESP-NOW Dropped</span><span id="rxDropped" class="v">0</span></div>
@@ -1264,8 +1441,31 @@ void handleRoot() {
           <span>Sound Siren on Ultrasonic Range</span>
           <input id="cfgUltSiren" type="checkbox">
         </div>
-        <div style="margin-top:10px">
+        <div class="form-row">
+          <span>PIR Night-Only Siren Guard</span>
+          <input id="cfgPirSched" type="checkbox">
+        </div>
+        <div class="form-row">
+          <span>PIR Guard Window (Midnight - 7 AM)</span>
+          <div style="display:flex;gap:4px;align-items:center">
+            <input id="cfgPirSH" type="number" min="0" max="23" style="width:55px" placeholder="00"> :
+            <input id="cfgPirSM" type="number" min="0" max="59" style="width:55px" placeholder="00">
+            <span style="font-size:.8rem;color:var(--muted);margin:0 2px">to</span>
+            <input id="cfgPirEH" type="number" min="0" max="23" style="width:55px" placeholder="07"> :
+            <input id="cfgPirEM" type="number" min="0" max="59" style="width:55px" placeholder="00">
+          </div>
+        </div>
+        <div class="form-row">
+          <span>Set Hub Clock (HH:MM)</span>
+          <div style="display:flex;gap:4px;align-items:center">
+            <input id="manHour" type="number" min="0" max="23" style="width:55px" placeholder="HH"> :
+            <input id="manMin" type="number" min="0" max="59" style="width:55px" placeholder="MM">
+            <button class="secondary" style="padding:4px 8px;font-size:.76rem" onclick="setManualTime()">Set</button>
+          </div>
+        </div>
+        <div style="margin-top:10px;display:flex;gap:8px">
           <button onclick="saveSettings()">Save Thresholds</button>
+          <button class="secondary" onclick="syncBrowserTime()">⏱️ Sync Browser Time</button>
         </div>
       </div>
 
@@ -1393,6 +1593,51 @@ async function refreshStatus(){
     document.getElementById('doorState').textContent = (d.doorOpen?"OPEN ":"CLOSED ") + "(" + d.door3 + "°)";
     document.getElementById('sirenHz').textContent = d.sirenActive ? (d.sirenHz + " Hz") : "OFF";
 
+    // System Clock HUD
+    if (d.time) {
+      document.getElementById('sysClockBadge').textContent = (d.time.synced ? "🕒 " : "⏱️ [12PM] ") + d.time.timeOnly;
+      document.getElementById('sysClockBadge').className = "badge " + (d.time.synced ? "b-ok" : "b-warn");
+      document.getElementById('sysClockText').textContent = d.time.clock + (d.time.synced ? " (Synced)" : " (Default 12PM)");
+    }
+
+    // Smart Lighting
+    const lBadge = document.getElementById('lightBadge');
+    const lText = document.getElementById('lightStateText');
+    if (d.lightState) {
+      lBadge.textContent = "LIGHT ON";
+      lBadge.className = "badge b-ok";
+      lText.textContent = "ON (3.3V Active)";
+      document.getElementById('btnLightToggle').textContent = "Turn OFF";
+    } else {
+      lBadge.textContent = "LIGHT OFF";
+      lBadge.className = "badge b-off";
+      lText.textContent = "OFF (0V Idle)";
+      document.getElementById('btnLightToggle').textContent = "Turn ON";
+    }
+
+    // PIR Schedule Status
+    if (d.cfg) {
+      const sh = String(d.cfg.pirSH).padStart(2,'0');
+      const sm = String(d.cfg.pirSM).padStart(2,'0');
+      const eh = String(d.cfg.pirEH).padStart(2,'0');
+      const em = String(d.cfg.pirEM).padStart(2,'0');
+      document.getElementById('pirWindowText').textContent = sh + ":" + sm + " - " + eh + ":" + em;
+      const pGuard = document.getElementById('pirGuardBadge');
+      if (!d.cfg.motSiren) {
+        pGuard.textContent = "SIREN MUTED";
+        pGuard.className = "badge b-off";
+      } else if (!d.cfg.pirSched) {
+        pGuard.textContent = "ARMED 24/7";
+        pGuard.className = "badge b-bad";
+      } else if (d.pirSchedActive) {
+        pGuard.textContent = "ARMED (NIGHT)";
+        pGuard.className = "badge b-bad";
+      } else {
+        pGuard.textContent = "QUIET HOURS";
+        pGuard.className = "badge b-off";
+      }
+    }
+
     // Network & Diags
     document.getElementById('wifiClients').textContent = d.wifi.apStations + " device(s) connected";
     document.getElementById('staStatus').textContent = d.wifi.staConnected ? (d.wifi.staSsid + " (" + d.wifi.staIp + ", " + d.wifi.staRssi + " dBm)") : (d.wifi.staSsid ? "Connecting..." : "Disabled");
@@ -1427,6 +1672,11 @@ async function refreshStatus(){
       document.getElementById('cfgDoor').value = d.cfg.doorMs;
       document.getElementById('cfgMotSiren').checked = d.cfg.motSiren;
       document.getElementById('cfgUltSiren').checked = d.cfg.ultSiren;
+      document.getElementById('cfgPirSched').checked = d.cfg.pirSched;
+      document.getElementById('cfgPirSH').value = d.cfg.pirSH;
+      document.getElementById('cfgPirSM').value = d.cfg.pirSM;
+      document.getElementById('cfgPirEH').value = d.cfg.pirEH;
+      document.getElementById('cfgPirEM').value = d.cfg.pirEM;
       document.getElementById('staSsid').value = d.wifi.staSsid;
     }
 
@@ -1460,11 +1710,33 @@ async function saveSettings(){
     gate_ms: document.getElementById('cfgGate').value,
     door_ms: document.getElementById('cfgDoor').value,
     mot_siren: document.getElementById('cfgMotSiren').checked ? 1 : 0,
-    ult_siren: document.getElementById('cfgUltSiren').checked ? 1 : 0
+    ult_siren: document.getElementById('cfgUltSiren').checked ? 1 : 0,
+    pir_sched: document.getElementById('cfgPirSched').checked ? 1 : 0,
+    pir_sh: document.getElementById('cfgPirSH').value,
+    pir_sm: document.getElementById('cfgPirSM').value,
+    pir_eh: document.getElementById('cfgPirEH').value,
+    pir_em: document.getElementById('cfgPirEM').value
   });
   await fetch('/api/config?' + p.toString(), {method:'POST'});
   alert('Settings saved to NVS!');
   cfgLoaded = false;
+  refreshStatus();
+}
+
+async function syncBrowserTime(){
+  const now = new Date();
+  const epoch = Math.floor(now.getTime() / 1000);
+  await fetch('/api/time?epoch=' + epoch, {method:'POST'});
+  alert('System clock synchronized with browser: ' + now.toLocaleTimeString());
+  refreshStatus();
+}
+
+async function setManualTime(){
+  const h = document.getElementById('manHour').value;
+  const m = document.getElementById('manMin').value;
+  if(h === '' || m === ''){ alert('Please enter hour and minute'); return; }
+  await fetch('/api/time?hour=' + h + '&min=' + m, {method:'POST'});
+  alert('System clock updated to ' + h.padStart(2,'0') + ':' + m.padStart(2,'0'));
   refreshStatus();
 }
 
@@ -1515,6 +1787,7 @@ void onWiFiEvent(WiFiEvent_t event) {
     char msg[64];
     snprintf(msg, sizeof(msg), "Home Wi-Fi connected! Assigned IP: %s", WiFi.localIP().toString().c_str());
     addEventLog("success", msg);
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     addEventLog("warning", "Home Wi-Fi station link disconnected");
   }
@@ -1555,6 +1828,9 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
+  pinMode(LIGHT_PIN, OUTPUT);
+  digitalWrite(LIGHT_PIN, LOW);
+
   pinMode(FIRE_SENSOR_PIN, INPUT);
   pinMode(MQ2_SENSOR_PIN, INPUT);
   pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN);
@@ -1567,6 +1843,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  initDefaultSystemTime();
   loadConfigFromNvs();
 
   // Servo timers
@@ -1602,9 +1879,11 @@ void setup() {
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/control", HTTP_POST, handleApiControl);
   server.on("/api/config", HTTP_POST, handleApiConfig);
+  server.on("/api/time", HTTP_POST, handleApiTime);
   server.on("/api/wifi", HTTP_POST, handleApiWifi);
   server.on("/api/cam/event", HTTP_POST, handleApiCamEvent);
   server.on("/api/cam/1/preview.jpg", HTTP_GET, []() { handleCamProxy(1); });
+  server.on("/api/cam/2/preview.jpg", HTTP_GET, []() { handleCamProxy(2); });
   server.begin();
 
   addEventLog("info", "Smart Home Hub started. Web Admin ready.");
@@ -1693,7 +1972,11 @@ void loop() {
   }
 
   // 7. Master alarm evaluation
-  bool motionAlarm = (lastMotionDetected && g_cfg.motionTriggersSiren);
+  bool pirScheduleActive = true;
+  if (g_cfg.pirScheduleEnabled) {
+    pirScheduleActive = isPirScheduleActive();
+  }
+  bool motionAlarm = (lastMotionDetected && g_cfg.motionTriggersSiren && pirScheduleActive);
   bool ultraAlarm  = (lastUltrasonicDetected && g_cfg.ultraTriggersSiren);
 
   lastAlarmActive = lastFireDetected || lastSmokeDetected || motionAlarm ||
@@ -1712,11 +1995,20 @@ void loop() {
   // 9. Serial debug monitor
   if (now - lastPrintMs >= 500) {
     lastPrintMs = now;
-    Serial.printf("Sensors: Flame=%d (%s) | Smoke=%d (%s) | PIR=%s | Ultra=%s | Alarm=%s | Gate=%s | Door=%s\n",
+    time_t printTime = time(nullptr);
+    struct tm printTm;
+    localtime_r(&printTime, &printTm);
+    char timePrintBuf[16];
+    strftime(timePrintBuf, sizeof(timePrintBuf), "%H:%M:%S", &printTm);
+
+    Serial.printf("[%s] Sensors: Flame=%d (%s) | Smoke=%d (%s) | PIR=%s (Guard:%s) | Ultra=%s | Light=%s | Alarm=%s | Gate=%s | Door=%s\n",
+                  timePrintBuf,
                   lastFlameAdc, lastFireDetected ? "FIRE!" : "ok",
                   lastSmokeAdc, lastSmokeDetected ? "SMOKE!" : "ok",
                   lastMotionDetected ? "MOTION" : "clear",
+                  pirScheduleActive ? "ARMED" : "QUIET",
                   lastUltrasonicDetected ? "NEAR" : "clear",
+                  lightState ? "ON" : "OFF",
                   lastAlarmActive ? (g_cfg.sirenMuted ? "MUTED" : "ACTIVE") : "off",
                   gateOpen ? "OPEN" : "closed",
                   doorOpen ? "OPEN" : "closed");

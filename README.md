@@ -8,14 +8,19 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
 
 1. **Main Hub (`[env:esp32dev]`, [`src/main.cpp`](src/main.cpp))**
    - **Safety Sensors**: Analog IR Flame (`GPIO34`), MQ-2 Smoke/Gas (`GPIO35`), PIR Motion (`GPIO27`), and HC-SR04 Ultrasonic (`TRIG=GPIO32`, `ECHO=GPIO33`, `<= 25.0 cm`) → sweeping **Siren Buzzer (`GPIO25`)**.
-   - **Car Gate Servos (`GPIO18`, `GPIO19`)**: `0° ↔ 180°` smooth non-blocking PWM ramp, opened exclusively (`5 seconds`) when Camera 2 recognizes an authorized car license plate.
+   - **PIR Scheduled Night Guard**: Restricts the loud siren activation on motion to the overnight window between **Midnight (00:00) and 7:00 AM (07:00)**; movement during the day displays in the UI but remains silent.
+   - **Smart Lighting Controller (`GPIO4`)**: 3.3V digital output driving an external transistor/MOSFET circuit to switch interior/exterior lights with dashboard toggle controls.
+   - **MFRC522 RFID Card Access**: Hardware SPI reader (`SS=GPIO5`, `RST=GPIO22`, `SCK=GPIO14`, `MOSI=GPIO13`, `MISO=GPIO12`) opening the dual car gate on authorized UID `52411902`.
+   - **Car Gate Servos (`GPIO18`, `GPIO19`)**: `0° ↔ 160°` smooth non-blocking PWM ramp, opened exclusively (`5 seconds`) when Camera 2 recognizes an authorized car plate or an authorized RFID card is presented.
    - **3rd Face Door Servo (`GPIO26`)**: `0° ↔ 180°` smooth non-blocking PWM ramp, opened exclusively (`3 seconds`) when Camera 1 recognizes an enrolled face.
-   - **Intruder Siren Pulse**: Triggers a **`4-second`** siren burst (`GPIO25`) whenever either camera reports an unrecognized face or unrecognized license plate.
+   - **Intruder Siren Pulse**: Triggers a **`4-second`** siren burst (`GPIO25`) whenever either camera reports an unrecognized face or unrecognized license plate, or an unauthorized RFID card is scanned.
    - **Wireless Hub & Web Admin Panel**: Hosts Wi-Fi SoftAP **`SmartHome-Net`** (password `smarthome123`, channel `1`, IP `http://192.168.4.1`) + optional Home Wi-Fi STA uplink, ESP-NOW receiver, and a **Full Web Admin Dashboard**:
+     - **Live System Clock & Time Sync**: Displays live clock (default boot time: 12:00 PM), 1-click Browser Time Sync, and manual time setter.
+     - **Smart Lighting Switch**: Interactive ON/OFF/Toggle dashboard buttons with live state feedback.
      - **Live Camera Streams**: Embedded side-by-side viewports for Camera 1 (Face) and Camera 2 (Plate) with live FPS/latency and direct/proxy streaming.
      - **Sensors & Telemetry**: Dynamic visual gauges and alert badges for Flame (`AO`), Smoke (`MQ-2`), Motion (`PIR`), and Ultrasonic (`HC-SR04`).
-     - **Manual Overrides**: Quick-action controls for Car Gate (open/close), Face Door (unlock/lock), and Siren Alarm (mute/test).
-     - **NVS Settings & Event Log**: Save custom thresholds, timers, and Home Wi-Fi credentials to Flash, and view the live rolling system event log.
+     - **Manual Overrides**: Quick-action controls for Car Gate (open/close), Face Door (unlock/lock), Smart Light (toggle), and Siren Alarm (mute/test).
+     - **NVS Settings & Event Log**: Save custom thresholds, PIR schedule hours, timers, and Home Wi-Fi credentials to Flash, and view the live rolling system event log.
 
 2. **Camera 1 — On-Device Face Recognition (`[env:cam_face]`, [`src/cam_face/main.cpp`](src/cam_face/main.cpp))**
    - Runs Espressif ESP-DL **2-stage face detection (`HumanFaceDetectMSR01` + `HumanFaceDetectMNP01`)** + **MobileFaceNet (`FaceRecognition112V1S8`)** 100% locally on the `HW-297` (`240×240` RGB565 in PSRAM).
@@ -62,15 +67,17 @@ A multi-node ESP32 smart home safety and biometric/vehicle access-control system
 
 | Component | Module Pin | ESP32 GPIO | Mode | Notes |
 | --- | --- | --- | --- | --- |
+| **Smart Light Transistor** | `Base / Gate` | `GPIO4` | Digital Output (`3.3 V`) | Connect through `1 kΩ` base resistor to NPN transistor (e.g. 2N2222) or N-channel logic MOSFET to drive 5V/12V lights |
 | **Flame Sensor** | `AO` | `GPIO34` | Analog Input (`ADC1`) | Triggers when `<= 500` |
 | **MQ-2 Smoke Sensor** | `AO` | `GPIO35` | Analog Input (`ADC1`) | Warm-up `30–60 s`; triggers when `>= 2000` |
-| **PIR Motion Sensor** | `OUT` | `GPIO27` | `INPUT_PULLDOWN` | Active `HIGH` (`3.3 V` logic) |
+| **PIR Motion Sensor** | `OUT` | `GPIO27` | `INPUT_PULLDOWN` | Active `HIGH` (`3.3 V` logic); siren only activates during night window (**Midnight–7 AM**) |
 | **Ultrasonic Sensor** | `TRIG` | `GPIO32` | Digital Output | 10 µs trigger pulse every `60 ms` (`<= 25.0 cm` triggers siren) |
 | **Ultrasonic Sensor** | `ECHO` | `GPIO33` | Digital Input | **Use 5 V → 3.3 V voltage divider** |
 | **Buzzer** | `SIG` / `+` | `GPIO25` | LEDC Tone PWM (10-bit) | `700 Hz ↔ 1800 Hz` alarm siren |
-| **Car Gate Servo 1** | `PWM` | `GPIO18` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate from Camera 2 |
-| **Car Gate Servo 2** | `PWM` | `GPIO19` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate from Camera 2 |
+| **Car Gate Servo 1** | `PWM` | `GPIO18` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate or valid RFID UID |
+| **Car Gate Servo 2** | `PWM` | `GPIO19` | `ESP32Servo` 50 Hz (16-bit) | Opens (`5 s`) on recognized car plate or valid RFID UID |
 | **Face Door Servo 3** | `PWM` | `GPIO26` | `ESP32Servo` 50 Hz (16-bit) | Opens (`3 s`) on recognized face from Camera 1 |
+| **MFRC522 RFID Reader** | `SDA` / `SS`<br>`SCK`<br>`MOSI`<br>`MISO`<br>`RST` | `GPIO5`<br>`GPIO14`<br>`GPIO13`<br>`GPIO12`<br>`GPIO22` | Hardware SPI (`MFRC522`) | Reads 13.56 MHz RFID tags; accepted UID: `52411902` |
 
 ### Flashing the `HW-297` (ESP32-CAM) Boards via USB-TTL
 
