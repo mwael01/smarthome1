@@ -55,11 +55,11 @@ constexpr int SERVO_MIN_US        = 500;
 constexpr int SERVO_MAX_US        = 2500;
 
 constexpr int SERVO1_CLOSED_ANGLE = 0;
-constexpr int SERVO1_OPEN_ANGLE   = 180;
+constexpr int SERVO1_OPEN_ANGLE   = 160; // Safety limit (reduced from 180° to avoid binding/stalling)
 constexpr int SERVO2_CLOSED_ANGLE = 0;
-constexpr int SERVO2_OPEN_ANGLE   = 180;
+constexpr int SERVO2_OPEN_ANGLE   = 160; // Safety limit (reduced from 180° to avoid binding/stalling)
 constexpr int DOOR3_CLOSED_ANGLE  = 0;
-constexpr int DOOR3_OPEN_ANGLE    = 180;
+constexpr int DOOR3_OPEN_ANGLE    = 160; // Safety limit (reduced from 180° to avoid binding/stalling)
 
 constexpr int SERVO_STEP_DEG      = 2;
 constexpr unsigned long SERVO_STEP_INTERVAL_MS = 20;
@@ -343,7 +343,8 @@ bool popCamPacket(IncomingCamPacket &out) {
 // Servo Helper Functions
 // ---------------------------------------------------------------------------
 int servoAngleToPulseUs(int angle) {
-  int clamped = constrain(angle, 0, 180);
+  // Clamped to 160° maximum to maintain safety margin against motor stall and gear breakage
+  int clamped = constrain(angle, 0, 160);
   long span = static_cast<long>(SERVO_MAX_US - SERVO_MIN_US);
   return SERVO_MIN_US + static_cast<int>((clamped * span + 90L) / 180L);
 }
@@ -595,8 +596,8 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
     telemetry = &faceCamState;
     srcName = "FACE-CAM";
   } else if (pkt.source == SmartHomeNet::CAM_SOURCE_PLATE) {
-    telemetry = &plateCamState;
-    srcName = "PLATE-CAM";
+    // Car plate camera is disabled; RFID controls the car gate
+    return;
   } else {
     return;
   }
@@ -625,17 +626,10 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
       snprintf(logMsg, sizeof(logMsg), "Face recognized: \"%s\" (%u%%) -> Door unlocked",
                telemetry->lastLabel, pkt.confidence);
       addEventLog("success", logMsg);
-    } else if (pkt.source == SmartHomeNet::CAM_SOURCE_PLATE) {
-      plateGateUntilMs = now + g_cfg.gateHoldMs;
-      setGateOpen(true);
-      snprintf(logMsg, sizeof(logMsg), "Plate matched: \"%s\" (%u%%) -> Gate opened",
-               telemetry->lastLabel, pkt.confidence);
-      addEventLog("success", logMsg);
     }
   } else if (pkt.event == SmartHomeNet::CAM_EVENT_UNKNOWN) {
     camAlarmUntilMs = now + g_cfg.camAlarmMs;
-    snprintf(logMsg, sizeof(logMsg), "INTRUDER ALERT: Unrecognized %s detected!",
-             (pkt.source == SmartHomeNet::CAM_SOURCE_FACE) ? "face" : "vehicle plate");
+    snprintf(logMsg, sizeof(logMsg), "INTRUDER ALERT: Unrecognized face detected!");
     addEventLog("danger", logMsg);
   }
 }
@@ -644,10 +638,14 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
 // Camera Image Proxy (Forward frames from camera nodes on SoftAP to client)
 // ---------------------------------------------------------------------------
 void handleCamProxy(int camNum) {
-  const char *host = (camNum == 1) ? "192.168.4.101" : "192.168.4.102";
+  if (camNum != 1) {
+    server.send(404, "text/plain", "Plate camera disabled (RFID in use)");
+    return;
+  }
+  const char *host = "192.168.4.101";
   WiFiClient client;
   if (!client.connect(host, 80, 600)) {
-    server.send(503, "text/plain", "Camera node unreachable");
+    server.send(503, "text/plain", "Face camera unreachable");
     return;
   }
 
@@ -661,7 +659,7 @@ void handleCamProxy(int camNum) {
   }
   if (!client.available()) {
     client.stop();
-    server.send(504, "text/plain", "Camera response timeout");
+    server.send(504, "text/plain", "Face camera timeout");
     return;
   }
 
@@ -707,6 +705,61 @@ void handleCamProxy(int camNum) {
     }
   }
   client.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Web API: Dual-Path Camera Event Endpoint (/api/cam/event)
+// Receives JSON access control events from camera nodes as an HTTP backup to ESP-NOW
+// ---------------------------------------------------------------------------
+void handleApiCamEvent() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "Missing body");
+    return;
+  }
+  String body = server.arg("plain");
+
+  int source = SmartHomeNet::CAM_SOURCE_FACE;
+  int event = SmartHomeNet::CAM_EVENT_HEARTBEAT;
+  int matchId = -1;
+  int confidence = 100;
+  char label[24] = "none";
+
+  int idx = body.indexOf("\"source\":");
+  if (idx >= 0) source = body.substring(idx + 9).toInt();
+  idx = body.indexOf("\"event\":");
+  if (idx >= 0) event = body.substring(idx + 8).toInt();
+  idx = body.indexOf("\"matchId\":");
+  if (idx >= 0) matchId = body.substring(idx + 10).toInt();
+  idx = body.indexOf("\"confidence\":");
+  if (idx >= 0) confidence = body.substring(idx + 13).toInt();
+  idx = body.indexOf("\"label\":\"");
+  if (idx >= 0) {
+    int end = body.indexOf("\"", idx + 9);
+    if (end > idx + 9) {
+      String l = body.substring(idx + 9, end);
+      strncpy(label, l.c_str(), sizeof(label) - 1);
+      label[sizeof(label) - 1] = '\0';
+    }
+  }
+
+  SmartHomeNet::CamEventPacket pkt = {};
+  pkt.magic = SmartHomeNet::PACKET_MAGIC;
+  pkt.source = static_cast<uint8_t>(source);
+  pkt.event = static_cast<uint8_t>(event);
+  pkt.matchId = static_cast<int16_t>(matchId);
+  pkt.confidence = static_cast<uint8_t>(constrain(confidence, 0, 100));
+  strncpy(pkt.label, label, sizeof(pkt.label) - 1);
+
+  IncomingCamPacket inPkt;
+  inPkt.pkt = pkt;
+  memset(inPkt.srcMac, 0, 6); // HTTP origin
+  handleCamEvent(inPkt, millis());
+
+  server.send(200, "application/json", "{\"status\":\"ok\",\"path\":\"http\"}");
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +835,13 @@ void handleApiStatus() {
           ",\"conf\":" + String(plateCamState.lastConfidence) +
           ",\"label\":\"" + smartHomeJsonEscape(plateCamState.lastLabel) + "\"" +
           ",\"ageSec\":" + String(plateCamState.seen ? ((now - plateCamState.lastEventMs) / 1000) : 9999) + "},";
+
+  // RFID Telemetry
+  json += "\"rfid\":{";
+  json += "\"lastUid\":\"" + lastRfidUid + "\",";
+  json += "\"acceptedUid\":\"" + String(ACCEPTED_RFID_UID) + "\",";
+  json += "\"lastScanSec\":" + String(lastRfidPrintMs > 0 ? ((now - lastRfidPrintMs) / 1000) : 9999);
+  json += "},";
 
   // Active Configuration
   json += "\"cfg\":{";
@@ -1062,27 +1122,24 @@ void handleRoot() {
       </div>
     </div>
 
-    <!-- Camera 2: Car Plate OCR -->
+    <!-- RFID Car Gate Access Control (Replaces Plate Cam) -->
     <div class="card">
       <div class="card-title">
-        <span>Camera 2: License Plate OCR (HW-297)</span>
-        <span id="cam2Status" class="badge b-off">CONNECTING...</span>
+        <span>🚗 RFID Car Gate Access (MFRC522)</span>
+        <span id="rfidStatus" class="badge b-ok">ACTIVE</span>
       </div>
-      <div class="cam-box">
-        <img id="cam2Img" class="cam-img" alt="Camera 2 License Plate Stream">
-        <div class="cam-overlay">
-          <span id="cam2Tag" class="badge b-off">SCANNING</span>
-          <span id="cam2Fps" style="background:rgba(0,0,0,0.6);padding:2px 6px;border-radius:4px;font-size:.72rem">-- ms</span>
-        </div>
+      <div class="rfid-box" style="padding:16px 12px;text-align:center;background:#0d1527;border-radius:8px;margin-bottom:12px;border:1px dashed #23324d">
+        <div style="font-size:1.8rem;margin-bottom:4px">💳</div>
+        <div style="font-size:.82rem;color:var(--muted)">Present RFID card to open Car Gate (Servos 1&amp;2 to 160°)</div>
+        <div style="margin-top:8px;font-family:monospace;font-size:1.15rem;font-weight:700;color:#06b6d4" id="rfidUidText">NO CARD SCANNED</div>
       </div>
       <div class="cam-meta">
-        <div class="row"><span class="k">Detected Plate</span><span id="cam2Plate" class="v">---</span></div>
-        <div class="row"><span class="k">Link / Last Seen</span><span id="cam2Link" class="v">---</span></div>
+        <div class="row"><span class="k">Accepted Card UID</span><span id="rfidAccepted" class="v" style="font-family:monospace">52411902</span></div>
+        <div class="row"><span class="k">Last Scan Activity</span><span id="rfidLastSeen" class="v">---</span></div>
       </div>
       <div class="cam-actions">
         <button onclick="triggerAction('gate_open')">🚗 Open Car Gate (Servos 1&amp;2)</button>
         <button class="secondary" onclick="triggerAction('gate_close')">⛔ Close Gate</button>
-        <a id="cam2LinkBtn" class="btn secondary" href="http://192.168.4.102/" target="_blank">Open Plate UI ↗</a>
       </div>
     </div>
   </div>
@@ -1238,22 +1295,41 @@ void handleRoot() {
 <script>
 let cfgLoaded = false;
 
-// Auto-refresh camera frames
+// Auto-refresh camera frames with direct stream support
 function streamCam(camId, imgId, badgeId, perfId, tagId){
+  const img = document.getElementById(imgId);
+  if (camId === 1) {
+    // Attempt direct real-time MJPEG stream first
+    const testImg = new Image();
+    testImg.onload = () => {
+      img.src = "http://192.168.4.101:81/stream";
+      document.getElementById(badgeId).textContent = "LIVE (MJPEG)";
+      document.getElementById(badgeId).className = "badge b-ok";
+      document.getElementById(perfId).textContent = "Real-time";
+    };
+    testImg.onerror = () => {
+      pollSnapshot(camId, imgId, badgeId, perfId);
+    };
+    testImg.src = "http://192.168.4.101:81/stream";
+    return;
+  }
+}
+
+function pollSnapshot(camId, imgId, badgeId, perfId){
   const img = document.getElementById(imgId);
   const next = new Image();
   const t0 = performance.now();
   next.onload = ()=>{
     img.src = next.src;
-    document.getElementById(badgeId).textContent = "LIVE";
+    document.getElementById(badgeId).textContent = "LIVE (SNAPSHOT)";
     document.getElementById(badgeId).className = "badge b-ok";
     document.getElementById(perfId).textContent = Math.round(performance.now() - t0) + " ms";
-    setTimeout(()=>streamCam(camId, imgId, badgeId, perfId, tagId), 350);
+    setTimeout(()=>pollSnapshot(camId, imgId, badgeId, perfId), 350);
   };
   next.onerror = ()=>{
     document.getElementById(badgeId).textContent = "OFFLINE";
     document.getElementById(badgeId).className = "badge b-bad";
-    setTimeout(()=>streamCam(camId, imgId, badgeId, perfId, tagId), 1600);
+    setTimeout(()=>pollSnapshot(camId, imgId, badgeId, perfId), 1600);
   };
   next.src = "/api/cam/" + camId + "/preview.jpg?t=" + Date.now();
 }
@@ -1324,18 +1400,22 @@ async function refreshStatus(){
     document.getElementById('sysHeap').textContent = Math.round(d.freeHeap/1024) + " KB";
     document.getElementById('rxDropped').textContent = d.rxDropped;
 
-    // Cameras Telemetry
+    // Camera 1 (Face Cam) Telemetry
     const c1Tag = document.getElementById('cam1Tag');
     c1Tag.textContent = d.faceCam.event;
     c1Tag.className = "badge " + (d.faceCam.event==='RECOGNIZED'?'b-ok':(d.faceCam.event==='UNKNOWN'?'b-bad':'b-off'));
     document.getElementById('cam1Who').textContent = d.faceCam.label + " (" + d.faceCam.conf + "%)";
     document.getElementById('cam1Link').textContent = d.faceCam.online ? ("Online (" + d.faceCam.ageSec + "s ago)") : "Offline";
 
-    const c2Tag = document.getElementById('cam2Tag');
-    c2Tag.textContent = d.plateCam.event;
-    c2Tag.className = "badge " + (d.plateCam.event==='RECOGNIZED'?'b-ok':(d.plateCam.event==='UNKNOWN'?'b-bad':'b-off'));
-    document.getElementById('cam2Plate').textContent = d.plateCam.label + " (" + d.plateCam.conf + "%)";
-    document.getElementById('cam2Link').textContent = d.plateCam.online ? ("Online (" + d.plateCam.ageSec + "s ago)") : "Offline";
+    // RFID Car Gate Telemetry (Replaces plateCam)
+    if(d.rfid){
+      document.getElementById('rfidUidText').textContent = d.rfid.lastUid ? d.rfid.lastUid : "NO CARD SCANNED";
+      document.getElementById('rfidAccepted').textContent = d.rfid.acceptedUid;
+      document.getElementById('rfidLastSeen').textContent = d.rfid.lastScanSec < 9999 ? (d.rfid.lastScanSec + "s ago") : "---";
+      const isAuth = (d.rfid.lastUid === d.rfid.acceptedUid);
+      document.getElementById('rfidStatus').textContent = isAuth ? "AUTHORIZED" : (d.rfid.lastUid ? "DENIED" : "ACTIVE");
+      document.getElementById('rfidStatus').className = "badge " + (isAuth ? "b-ok" : (d.rfid.lastUid ? "b-bad" : "b-ok"));
+    }
 
     // Populate Settings once
     if(!cfgLoaded && d.cfg){
@@ -1409,7 +1489,6 @@ async function saveWifi(disconnect){
 
 // Start live streams & polling
 streamCam(1, 'cam1Img', 'cam1Status', 'cam1Fps', 'cam1Tag');
-streamCam(2, 'cam2Img', 'cam2Status', 'cam2Fps', 'cam2Tag');
 refreshStatus();
 setInterval(refreshStatus, 1000);
 </script>
@@ -1524,8 +1603,8 @@ void setup() {
   server.on("/api/control", HTTP_POST, handleApiControl);
   server.on("/api/config", HTTP_POST, handleApiConfig);
   server.on("/api/wifi", HTTP_POST, handleApiWifi);
+  server.on("/api/cam/event", HTTP_POST, handleApiCamEvent);
   server.on("/api/cam/1/preview.jpg", HTTP_GET, []() { handleCamProxy(1); });
-  server.on("/api/cam/2/preview.jpg", HTTP_GET, []() { handleCamProxy(2); });
   server.begin();
 
   addEventLog("info", "Smart Home Hub started. Web Admin ready.");
@@ -1559,7 +1638,7 @@ void loop() {
   // 4. Update non-blocking ultrasonic sensor
   updateUltrasonicSensor(now);
 
-  // 4b. RFID card reader — print UID to Serial when a new card is presented
+  // 4b. RFID card reader — controls main car gate (Servos 1 & 2 to 160°)
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     String uid;
     for (byte i = 0; i < rfid.uid.size; i++) {
@@ -1576,10 +1655,16 @@ void loop() {
       if (uid == ACCEPTED_RFID_UID) {
         plateGateUntilMs = now + g_cfg.gateHoldMs;
         setGateOpen(true);
-        Serial.println("[RFID] Accepted card -> Gate opened (Servos 1 & 2)");
+        char msg[72];
+        snprintf(msg, sizeof(msg), "RFID Authorized [%s] -> Car Gate opened", uid.c_str());
+        addEventLog("success", msg);
+        Serial.println("[RFID] Accepted card -> Gate opened (Servos 1 & 2 to 160°)");
       } else {
         camAlarmUntilMs = now + g_cfg.camAlarmMs;
         startSiren(now);
+        char msg[72];
+        snprintf(msg, sizeof(msg), "RFID Unknown [%s] -> Intruder alarm", uid.c_str());
+        addEventLog("danger", msg);
         Serial.println("[RFID] Unknown card -> Intruder alarm started");
       }
     }

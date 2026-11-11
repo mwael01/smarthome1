@@ -11,6 +11,11 @@ bool camNetSendEvent(SmartHomeNet::CamEventType event,
                      uint8_t confidence,
                      const char *label);
 
+bool camNetPostHttpEvent(SmartHomeNet::CamEventType event,
+                         int16_t matchId,
+                         uint8_t confidence,
+                         const char *label);
+
 bool camNetHubConnected();
 bool camNetFallbackApActive();
 bool camNetLastSendOk();

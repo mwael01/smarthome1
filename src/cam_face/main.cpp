@@ -353,29 +353,10 @@ void faceWorkerTask(void * /*param*/) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       fbNullStreak++;
-      if (fbNullStreak >= 25) { // ~1 s of empty grabs -> reinitialize OV2640
-        Serial.println("[FACE] Camera frame grab stalled; re-initializing OV2640...");
-        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
-          g_status.cameraReady = false;
-          xSemaphoreGive(stateMutex);
-        }
-        esp_camera_deinit();
-        bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
-                                     FRAMESIZE_240X240,
-                                     12,
-                                     activeCfg.hmirror,
-                                     activeCfg.vflip);
-        if (camOk) {
-          camHwSetFlashLed(activeCfg.flashAuto ? (flashOn ? activeCfg.flashDuty : 0)
-                                               : activeCfg.flashDuty);
-        }
-        if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
-          g_status.cameraReady = camOk;
-          xSemaphoreGive(stateMutex);
-        }
-        fbNullStreak = 0;
+      if (fbNullStreak % 50 == 0) {
+        Serial.printf("[FACE] Warning: esp_camera_fb_get returned null (streak %d)\n", fbNullStreak);
       }
-      vTaskDelay(pdMS_TO_TICKS(40));
+      vTaskDelay(pdMS_TO_TICKS(30));
       continue;
     }
     fbNullStreak = 0;
@@ -584,9 +565,9 @@ void faceWorkerTask(void * /*param*/) {
       xSemaphoreGive(stateMutex);
     }
 
-    // Adaptive yield: short delay while actively recognizing (max throughput but
-    // still lets loopTask run HTTP + heartbeats on Core 1), longer delay when idle.
-    vTaskDelay(pdMS_TO_TICKS(detected || bestFace ? 1 : 5));
+    // Adaptive cooperative yield: gives loopTask (HTTP server, preview snapshots,
+    // and ESP-NOW/heartbeats) sufficient CPU slices on Core 1 without stalling inference.
+    vTaskDelay(pdMS_TO_TICKS(detected || bestFace ? 10 : 30));
   }
 }
 
@@ -1580,15 +1561,16 @@ void setup() {
 
   FaceConfig cfg;
   loadConfigFromNvs(cfg);
-  // Camera disabled — focusing on main board RFID work.
-  // bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
-  //                              FRAMESIZE_240X240,
-  //                              12,
-  //                              cfg.hmirror,
-  //                              cfg.vflip);
-  bool camOk = false;
+  bool camOk = camHwInitCamera(PIXFORMAT_RGB565,
+                               FRAMESIZE_240X240,
+                               12,
+                               cfg.hmirror,
+                               cfg.vflip);
   if (camOk) {
-    camHwSetFlashLed(cfg.flashAuto ? cfg.flashDuty : cfg.flashDuty);
+    camHwSetFlashLed(cfg.flashAuto ? 0 : cfg.flashDuty);
+    Serial.println("[FACE] OV2640 camera initialized successfully (240x240 RGB565).");
+  } else {
+    Serial.println("[FACE] ERROR: OV2640 camera initialization failed!");
   }
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     g_status.cfg = cfg;
@@ -1599,7 +1581,7 @@ void setup() {
   camNetInit(SmartHomeNet::CAM_SOURCE_FACE);
 
   // Dedicated real-time MJPEG streaming task on port 81
-  // camHwStartStreamServer(STREAM_PORT);
+  camHwStartStreamServer(STREAM_PORT);
 
   // HTTP Web Server routes on port 80
   server.on("/", HTTP_GET, handleRoot);
@@ -1622,22 +1604,20 @@ void setup() {
   server.begin();
 
   // Dual-core split: Core 0 = Wi-Fi/lwIP + MJPEG stream (prio 1, set in cam_hw).
-  // Core 1 = face recognition worker (prio 2) + Arduino loop / HTTP + ESP-NOW (prio 1).
-  // Worker runs faster than loopTask so recognition never starves; it yields to
-  // loopTask during blocking frame grabs via vTaskDelay(0)/adaptive delay.
+  // Core 1 = face recognition worker (prio 1) + Arduino loop / HTTP + ESP-NOW (prio 1).
+  // Both run cooperatively at priority 1 to ensure networking and WebServer are never starved.
   vTaskPrioritySet(nullptr, 1);
 
-  // Face recognition worker disabled (camera off).
-  // if (camOk) {
-  //   xTaskCreatePinnedToCore(faceWorkerTask,
-  //                           "face_worker",
-  //                           16384,
-  //                           nullptr,
-  //                           2,
-  //                           nullptr,
-  //                           1); // Pin to Core 1 (Core 0 handles Wi-Fi + Stream)
-  //   Serial.println("Face worker started (Core 1, prio 2). loopTask prio 1.");
-  // }
+  if (camOk) {
+    xTaskCreatePinnedToCore(faceWorkerTask,
+                            "face_worker",
+                            16384,
+                            nullptr,
+                            1, // Equal priority to loopTask for cooperative execution
+                            nullptr,
+                            1); // Pin to Core 1
+    Serial.println("[FACE] Face recognition worker started on Core 1 (prio 1).");
+  }
 }
 
 void loop() {
