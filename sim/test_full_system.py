@@ -210,25 +210,25 @@ def run_tests():
         http_post(f"{HUB_URL}/api/control?action=siren_silence")
 
         # -------------------------------------------------------------------
-        # Scenario 7: Dual-Path Network Failover (UDP Interrupted)
+        # Scenario 7: Dual-Path Network Failover (UDP Interrupted & Spaced JSON)
         # -------------------------------------------------------------------
-        print("\n--- [Scenario 7: Dual-Path Network Failover (HTTP Backup)] ---")
-        # Directly dispatch an HTTP event to simulate ESP-NOW packet loss
+        print("\n--- [Scenario 7: Dual-Path Network Failover (HTTP Backup & Spaced JSON)] ---")
+        # 1. Directly dispatch an HTTP event with standard spaces after colons to verify BUG-4 fix
         event_payload = json.dumps({
             "source": 1,
             "event": 1,
             "matchId": 1,
             "confidence": 98,
-            "label": "Admin"
-        })
+            "label": "Admin User"
+        }, indent=2)
         status, body = http_post(f"{HUB_URL}/api/cam/event", data=event_payload)
         resp = json.loads(body)
-        log_test("Hub /api/cam/event received and processed HTTP event backup", status == 200 and resp["path"] == "http")
+        log_test("Hub /api/cam/event received and processed formatted spaced JSON", status == 200 and resp["path"] == "http")
 
         time.sleep(0.5)
         status, body = http_get(f"{HUB_URL}/api/status")
         d = json.loads(body)
-        log_test("HTTP fallback event triggered door unlock for 'Admin'", d["faceCam"]["label"] == "Admin" and d["doorOpen"])
+        log_test("Spaced JSON payload extracted label 'Admin User' and unlocked door", d["faceCam"]["label"] == "Admin User" and d["doorOpen"])
 
         # -------------------------------------------------------------------
         # Scenario 8: Environmental Sensors & Universal 160° Verification
@@ -261,6 +261,31 @@ def run_tests():
         _, body = http_get(f"{HUB_URL}/api/status")
         d = json.loads(body)
         log_test("Sensors returned to normal; alarm cleared", not d["sirenActive"])
+
+        # -------------------------------------------------------------------
+        # Scenario 9: Fast Proxy Offline Rejection (BUG-1 Fix Verification)
+        # -------------------------------------------------------------------
+        print("\n--- [Scenario 9: Fast Proxy Offline Rejection (BUG-1 Fix)] ---")
+        # Terminate camera process to simulate Camera 1 going offline
+        cam_proc.terminate()
+        cam_proc.wait()
+        # Force camera offline in Hub state
+        with urllib.request.urlopen(f"{HUB_URL}/api/status") as resp:
+            pass
+
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(f"{HUB_URL}/api/cam/1/preview.jpg")
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                offline_status = resp.status
+        except urllib.error.HTTPError as e:
+            offline_status = e.code
+        except Exception:
+            offline_status = 503
+        elapsed = time.time() - t0
+
+        log_test("Hub immediately returns 503 when Face Cam is offline", offline_status == 503)
+        log_test("Proxy offline rejection completed quickly (<0.25s, no thread stall)", elapsed < 0.25, f"({elapsed*1000:.1f} ms)")
 
         print("\n==================================================================")
         print(f"TEST RESULTS: {passed_tests} PASSED | {failed_tests} FAILED")

@@ -51,14 +51,14 @@ void camStreamTask(void *pvParameters) {
           if (clients[slot]) {
             clients[slot].stop();
           }
-          // Read HTTP request lines
+          // Read HTTP request lines (fast timeout avoids stalling existing streams)
           unsigned long t0 = millis();
-          while (newClient.connected() && (millis() - t0 < 800)) {
+          while (newClient.connected() && (millis() - t0 < 200)) {
             if (newClient.available()) {
               String l = newClient.readStringUntil('\n');
               if (l == "\r" || l.length() == 0) break;
             } else {
-              vTaskDelay(pdMS_TO_TICKS(10));
+              vTaskDelay(pdMS_TO_TICKS(5));
             }
           }
 

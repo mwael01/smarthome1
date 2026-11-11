@@ -101,7 +101,7 @@ unsigned long lastRfidPrintMs = 0;
 constexpr unsigned long RFID_PRINT_INTERVAL_MS = 2000;
 String lastRfidUid;
 
-// Accepted RFID card UID — triggers the 3rd servo (door) when presented.
+// Accepted RFID card UID — triggers the car gate (Servos 1 & 2 to 160°) when presented.
 constexpr char ACCEPTED_RFID_UID[] = "52411902";
 
 // ---------------------------------------------------------------------------
@@ -726,9 +726,16 @@ void handleCamProxy(int camNum) {
     server.send(404, "text/plain", "Plate camera disabled (RFID in use)");
     return;
   }
+  unsigned long now = millis();
+  bool faceOnline = faceCamState.seen && (now - faceCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
+  if (!faceOnline) {
+    server.send(503, "text/plain", "Face camera offline (no telemetry)");
+    return;
+  }
+
   const char *host = "192.168.4.101";
   WiFiClient client;
-  if (!client.connect(host, 80, 600)) {
+  if (!client.connect(host, 80, 200)) {
     server.send(503, "text/plain", "Face camera unreachable");
     return;
   }
@@ -738,7 +745,7 @@ void handleCamProxy(int camNum) {
   client.print("\r\nConnection: close\r\n\r\n");
 
   unsigned long startMs = millis();
-  while (!client.available() && (millis() - startMs < 750)) {
+  while (!client.available() && (millis() - startMs < 250)) {
     delay(5);
   }
   if (!client.available()) {
@@ -755,7 +762,7 @@ void handleCamProxy(int camNum) {
   }
 
   int contentLength = 0;
-  while (client.connected() && (millis() - startMs < 1100)) {
+  while (client.connected() && (millis() - startMs < 500)) {
     String line = client.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) break; // End of HTTP headers
@@ -778,7 +785,7 @@ void handleCamProxy(int camNum) {
   WiFiClient webClient = server.client();
   uint8_t buf[1024];
   int remaining = contentLength;
-  while (remaining > 0 && client.connected() && (millis() - startMs < 1600)) {
+  while (remaining > 0 && client.connected() && (millis() - startMs < 1200)) {
     int toRead = min(remaining, static_cast<int>(sizeof(buf)));
     int bytesRead = client.read(buf, toRead);
     if (bytesRead > 0) {
@@ -787,6 +794,10 @@ void handleCamProxy(int camNum) {
     } else {
       delay(1);
     }
+    // Keep critical actuators and siren sweep alive during proxy transfers
+    unsigned long curMs = millis();
+    updateAllServos(curMs);
+    updateSiren(curMs);
   }
   client.stop();
 }
@@ -812,23 +823,12 @@ void handleApiCamEvent() {
   int confidence = 100;
   char label[24] = "none";
 
-  int idx = body.indexOf("\"source\":");
-  if (idx >= 0) source = body.substring(idx + 9).toInt();
-  idx = body.indexOf("\"event\":");
-  if (idx >= 0) event = body.substring(idx + 8).toInt();
-  idx = body.indexOf("\"matchId\":");
-  if (idx >= 0) matchId = body.substring(idx + 10).toInt();
-  idx = body.indexOf("\"confidence\":");
-  if (idx >= 0) confidence = body.substring(idx + 13).toInt();
-  idx = body.indexOf("\"label\":\"");
-  if (idx >= 0) {
-    int end = body.indexOf("\"", idx + 9);
-    if (end > idx + 9) {
-      String l = body.substring(idx + 9, end);
-      strncpy(label, l.c_str(), sizeof(label) - 1);
-      label[sizeof(label) - 1] = '\0';
-    }
-  }
+  int intVal = 0;
+  if (smartHomeJsonGetInt(body, "source", intVal)) source = intVal;
+  if (smartHomeJsonGetInt(body, "event", intVal)) event = intVal;
+  if (smartHomeJsonGetInt(body, "matchId", intVal)) matchId = intVal;
+  if (smartHomeJsonGetInt(body, "confidence", intVal)) confidence = intVal;
+  smartHomeJsonGetString(body, "label", label, sizeof(label));
 
   SmartHomeNet::CamEventPacket pkt = {};
   pkt.magic = SmartHomeNet::PACKET_MAGIC;
@@ -837,6 +837,7 @@ void handleApiCamEvent() {
   pkt.matchId = static_cast<int16_t>(matchId);
   pkt.confidence = static_cast<uint8_t>(constrain(confidence, 0, 100));
   strncpy(pkt.label, label, sizeof(pkt.label) - 1);
+  pkt.label[sizeof(pkt.label) - 1] = '\0';
 
   IncomingCamPacket inPkt;
   inPkt.pkt = pkt;
@@ -1789,7 +1790,11 @@ void onWiFiEvent(WiFiEvent_t event) {
     addEventLog("success", msg);
     configTime(0, 0, "pool.ntp.org", "time.google.com");
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-    addEventLog("warning", "Home Wi-Fi station link disconnected");
+    static unsigned long lastStaDiscMs = 0;
+    if (millis() - lastStaDiscMs >= 10000) {
+      lastStaDiscMs = millis();
+      addEventLog("warning", "Home Wi-Fi station link disconnected");
+    }
   }
 }
 
@@ -1846,8 +1851,11 @@ void setup() {
   initDefaultSystemTime();
   loadConfigFromNvs();
 
-  // Servo timers
+  // Servo timers (allocate all 4 timers to ensure clean channel allocation)
   ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
   attachGateServo(gateServo1, GATE_SERVO_1_PIN, currentServo1Angle, "gate servo 1");
   attachGateServo(gateServo2, GATE_SERVO_2_PIN, currentServo2Angle, "gate servo 2");
   attachGateServo(doorServo3, DOOR_SERVO_3_PIN, currentDoor3Angle, "face door servo 3");

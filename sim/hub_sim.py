@@ -482,6 +482,17 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/cam/1/preview.jpg":
+            # Fast offline check matching firmware BUG-1 fix
+            now = time.time()
+            with g_hub.lock:
+                face_online = g_hub.face_cam_seen and (now - g_hub.face_cam_last_seen <= CAM_ONLINE_TIMEOUT)
+            if not face_online:
+                self.send_response(503)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"Face camera offline (no telemetry)")
+                return
+
             # Proxy to virtual face camera
             try:
                 req = urllib.request.Request("http://127.0.0.1:8081/preview.jpg", headers={"User-Agent": "HubProxy"})

@@ -81,6 +81,40 @@ void test_json_escaping() {
   TEST_ASSERT_EQUAL_STRING("NormalText123", clean.c_str());
 }
 
+void test_json_parsing_whitespace_tolerance() {
+  // 1. Compact JSON without spaces
+  String compactJson = "{\"source\":1,\"event\":1,\"matchId\":3,\"confidence\":94,\"label\":\"Khaled\"}";
+  int intVal = 0;
+  char labelBuf[24] = "";
+  TEST_ASSERT_TRUE(smartHomeJsonGetInt(compactJson, "source", intVal));
+  TEST_ASSERT_EQUAL_INT(1, intVal);
+  TEST_ASSERT_TRUE(smartHomeJsonGetInt(compactJson, "event", intVal));
+  TEST_ASSERT_EQUAL_INT(1, intVal);
+  TEST_ASSERT_TRUE(smartHomeJsonGetInt(compactJson, "matchId", intVal));
+  TEST_ASSERT_EQUAL_INT(3, intVal);
+  TEST_ASSERT_TRUE(smartHomeJsonGetInt(compactJson, "confidence", intVal));
+  TEST_ASSERT_EQUAL_INT(94, intVal);
+  TEST_ASSERT_TRUE(smartHomeJsonGetString(compactJson, "label", labelBuf, sizeof(labelBuf)));
+  TEST_ASSERT_EQUAL_STRING("Khaled", labelBuf);
+
+  // 2. Spaced JSON (standard json.dumps output)
+  String spacedJson = "{\"source\": 1, \"event\": 2, \"matchId\": -1, \"confidence\": 0, \"label\": \"UNKNOWN\"}";
+  TEST_ASSERT_TRUE(smartHomeJsonGetInt(spacedJson, "source", intVal));
+  TEST_ASSERT_EQUAL_INT(1, intVal);
+  TEST_ASSERT_TRUE(smartHomeJsonGetInt(spacedJson, "event", intVal));
+  TEST_ASSERT_EQUAL_INT(2, intVal);
+  TEST_ASSERT_TRUE(smartHomeJsonGetInt(spacedJson, "matchId", intVal));
+  TEST_ASSERT_EQUAL_INT(-1, intVal);
+  TEST_ASSERT_TRUE(smartHomeJsonGetString(spacedJson, "label", labelBuf, sizeof(labelBuf)));
+  TEST_ASSERT_EQUAL_STRING("UNKNOWN", labelBuf);
+
+  // 3. Substring key safety: key "id" must NOT match inside "matchId"
+  TEST_ASSERT_FALSE(smartHomeJsonGetInt(compactJson, "id", intVal));
+
+  // 4. Missing key returns false
+  TEST_ASSERT_FALSE(smartHomeJsonGetInt(compactJson, "missingKey", intVal));
+}
+
 void setup() {
   delay(1000);
   UNITY_BEGIN();
@@ -88,6 +122,7 @@ void setup() {
   RUN_TEST(test_servo_stepping);
   RUN_TEST(test_cam_event_packet_size_and_packing);
   RUN_TEST(test_json_escaping);
+  RUN_TEST(test_json_parsing_whitespace_tolerance);
   UNITY_END();
 }
 

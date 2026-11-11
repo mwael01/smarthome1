@@ -1611,12 +1611,12 @@ void setup() {
   if (camOk) {
     xTaskCreatePinnedToCore(faceWorkerTask,
                             "face_worker",
-                            16384,
+                            24576, // 24 KB stack ensures generous headroom for MobileFaceNet S8
                             nullptr,
                             1, // Equal priority to loopTask for cooperative execution
                             nullptr,
                             1); // Pin to Core 1
-    Serial.println("[FACE] Face recognition worker started on Core 1 (prio 1).");
+    Serial.println("[FACE] Face recognition worker started on Core 1 (prio 1, 24KB stack).");
   }
 }
 

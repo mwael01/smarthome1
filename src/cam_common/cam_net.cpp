@@ -22,6 +22,7 @@ SemaphoreHandle_t s_netMutex = nullptr;
 bool s_espNowReady = false;
 bool s_hubPeerAdded = false;
 uint8_t s_hubBssid[6] = {0};
+uint8_t s_hubChannel = 0;
 
 volatile bool s_fallbackApActive = false;
 unsigned long s_bootMs = 0;
@@ -72,19 +73,20 @@ void syncHubPeerLocked() {
 
   uint8_t curChannel = WiFi.channel();
 
-  if (!s_hubPeerAdded || memcmp(s_hubBssid, bssid, 6) != 0) {
+  if (!s_hubPeerAdded || memcmp(s_hubBssid, bssid, 6) != 0 || s_hubChannel != curChannel) {
     if (s_hubPeerAdded && esp_now_is_peer_exist(s_hubBssid)) {
       esp_now_del_peer(s_hubBssid);
     }
     memcpy(s_hubBssid, bssid, 6);
+    s_hubChannel = curChannel;
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, s_hubBssid, 6);
-    peer.channel = curChannel;
+    peer.channel = 0; // 0 = automatically follow active STA channel
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     s_hubPeerAdded = (esp_now_add_peer(&peer) == ESP_OK);
     if (s_hubPeerAdded) {
-      Serial.printf("ESP-NOW Hub peer registered: %02X:%02X:%02X:%02X:%02X:%02X (ch %d)\n",
+      Serial.printf("ESP-NOW Hub peer registered: %02X:%02X:%02X:%02X:%02X:%02X (STA ch %d, auto-track)\n",
                     s_hubBssid[0], s_hubBssid[1], s_hubBssid[2],
                     s_hubBssid[3], s_hubBssid[4], s_hubBssid[5], curChannel);
     }
@@ -226,6 +228,7 @@ bool camNetPostHttpEvent(SmartHomeNet::CamEventType event,
                         static_cast<int>(strlen(jsonBody)), jsonBody);
 
   client.write(reinterpret_cast<const uint8_t *>(req), reqLen);
+  client.flush();
   client.stop();
   return true;
 }
