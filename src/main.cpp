@@ -317,8 +317,8 @@ bool isRfidHealthy() {
   }
   // Verify registers configured by PCD_Init() to catch brownout/power-glitch resets
   byte tMode = rfid.PCD_ReadRegister(MFRC522::TModeReg);
-  byte txAuto = rfid.PCD_ReadRegister(MFRC522::TxAutoReg);
-  return (tMode == 0x80) && (txAuto == 0x40);
+  byte txAsk = rfid.PCD_ReadRegister(MFRC522::TxASKReg);
+  return (tMode == 0x80) && (txAsk == 0x40);
 }
 
 void hardwareResetRfidPin() {
