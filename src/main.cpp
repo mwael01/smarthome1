@@ -2341,6 +2341,7 @@ void setup() {
 
   Serial.begin(115200);
   delay(200);
+  Serial.printf("[BOOT] Reset reason: %d\n", static_cast<int>(esp_reset_reason()));
 
   initDefaultSystemTime();
   loadConfigFromNvs();
@@ -2453,7 +2454,9 @@ void loop() {
   }
 
   // 4c. RFID card reader — controls main car gate (Servos 1 & 2 to 160°)
-  if (rfidOnline && rfid.PICC_IsNewCardPresent()) {
+  // Skip SPI polling while gate servos are actively sweeping to avoid RF/SPI + motor inrush overlap
+  bool gateServosMoving = (currentServo1Angle != targetServo1Angle) || (currentServo2Angle != targetServo2Angle);
+  if (rfidOnline && !gateServosMoving && rfid.PICC_IsNewCardPresent()) {
     if (rfid.PICC_ReadCardSerial()) {
       String uid;
       for (byte i = 0; i < rfid.uid.size; i++) {
@@ -2465,13 +2468,12 @@ void loop() {
       lastRfidUid = uid;
 
       if (uid == ACCEPTED_RFID_UID) {
-        plateGateUntilMs = now + g_cfg.gateHoldMs;
+        plateGateUntilMs = millis() + g_cfg.gateHoldMs;
         setGateOpen(true);
         if (shouldLog) {
           lastRfidPrintMs = now;
           Serial.print("[RFID] Card UID: ");
           Serial.println(uid);
-          if (g_cfg.voiceSpokenEnabled) speakSentence(VOICE_SENT_ACCESS_GRANTED);
           char msg[72];
           snprintf(msg, sizeof(msg), "RFID Authorized [%s] -> Car Gate opened", uid.c_str());
           addEventLog("success", msg);
