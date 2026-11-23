@@ -926,7 +926,17 @@ void handleCommandAck() {
 
 void handleStatus() {
   unsigned long now = millis();
-  StreamStatusSnapshot snap;
+  // Return a safe health snapshot even if the capture task briefly owns the
+  // mutex. Missing laptop feedback must never make this endpoint fail.
+  StreamStatusSnapshot snap = {};
+  snap.frameWidth = 640;
+  snap.frameHeight = 480;
+  strcpy(snap.laptopModel, "Laptop AI");
+  strcpy(snap.faceQuality, "NO_FACE");
+  strcpy(snap.lastResult, "NONE");
+  strcpy(snap.lastMatchName, "---");
+  strcpy(snap.pendingAction, "none");
+  snap.pendingDeleteId = -1;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
     if (g_lastLaptopFeedbackMs != 0 && (now - g_lastLaptopFeedbackMs <= LAPTOP_LINK_TIMEOUT_MS)) {
       g_status.laptopConnected = true;
