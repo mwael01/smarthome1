@@ -1,4 +1,4 @@
-// Smart Home Camera 1 (Temporary Offloaded Mode) — High-FPS Stream + Remote Laptop AI Feedback
+// ESP32-S3 face camera — high-FPS stream + remote laptop AI feedback
 // Focuses exclusively on:
 //   1. Real-time hardware MJPEG live video streaming (:81/stream & /preview.jpg)
 //   2. Darkness + Motion Auto-Flash (5-second auto-off)

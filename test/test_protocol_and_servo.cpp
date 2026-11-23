@@ -10,7 +10,7 @@ constexpr int SERVO_MAX_US = 2500;
 int testServoAngleToPulseUs(int angle) {
   int clamped = constrain(angle, 0, 160);
   long span = static_cast<long>(SERVO_MAX_US - SERVO_MIN_US);
-  return SERVO_MIN_US + static_cast<int>((clamped * span + 90L) / 180L);
+  return SERVO_MIN_US + static_cast<int>((clamped * span + 80L) / 160L);
 }
 
 int testStepServoAngle(int current, int target, int maxStep) {
@@ -23,12 +23,12 @@ void test_servo_clamping_and_pulse_us() {
   // 0° must equal 500 µs
   TEST_ASSERT_EQUAL_INT(500, testServoAngleToPulseUs(0));
 
-  // 160° must equal 2278 µs (500 + round(160 * 2000 / 180) = 500 + 1778 = 2278)
-  TEST_ASSERT_EQUAL_INT(2278, testServoAngleToPulseUs(160));
+  // 160° must reach the configured maximum pulse.
+  TEST_ASSERT_EQUAL_INT(2500, testServoAngleToPulseUs(160));
 
   // Any angle exceeding 160° must be clamped strictly to 160° (safety margin)
-  TEST_ASSERT_EQUAL_INT(2278, testServoAngleToPulseUs(180));
-  TEST_ASSERT_EQUAL_INT(2278, testServoAngleToPulseUs(220));
+  TEST_ASSERT_EQUAL_INT(2500, testServoAngleToPulseUs(180));
+  TEST_ASSERT_EQUAL_INT(2500, testServoAngleToPulseUs(220));
 
   // Negative angles must clamp to 0° (500 µs)
   TEST_ASSERT_EQUAL_INT(500, testServoAngleToPulseUs(-10));

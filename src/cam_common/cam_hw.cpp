@@ -315,7 +315,9 @@ bool camHwInitCamera(pixformat_t pixelFormat,
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.jpeg_quality = jpegQuality;
-  config.fb_count = psramFound() ? 2 : 1;
+  // Triple buffering keeps capture DMA fed while the stream task transmits the
+  // previous frame. This is especially important on the S3 camera with PSRAM.
+  config.fb_count = psramFound() ? 3 : 1;
 
   // Always execute esp_camera_init on Core 0 (PRO_CPU) so esp_intr_alloc binds
   // ll_cam_vsync_isr and ll_cam_dma_isr to Core 0 instead of Core 1 (AI core).
@@ -351,7 +353,7 @@ bool camHwInitCamera(pixformat_t pixelFormat,
     if (!psramFound() && config.frame_size > FRAMESIZE_QVGA) {
       config.frame_size = FRAMESIZE_QVGA;
     }
-    config.fb_count = psramFound() ? 2 : 1;
+    config.fb_count = psramFound() ? 3 : 1;
 
     if (xPortGetCoreID() == 0) {
       err = esp_camera_init(&config);
@@ -429,7 +431,7 @@ void publishPreviewJpeg(const uint8_t *jpgBuf, size_t jpgLen) {
   if (!jpgBuf || jpgLen == 0) return;
 
   if (s_previewMutex && xSemaphoreTake(s_previewMutex, pdMS_TO_TICKS(40)) == pdTRUE) {
-    if (jpgLen > s_previewJpgCap) {
+    if (jpgLen + PART_TRAILER_RESERVE > s_previewJpgCap) {
       size_t newCap = (jpgLen + 8191) & ~4095;
       if (newCap < 32768) newCap = 32768;
       size_t allocSize = PART_HEADER_RESERVE + newCap + PART_TRAILER_RESERVE;
@@ -497,12 +499,23 @@ void camHwHandlePreviewRequest(WebServer &server) {
     server.send(503, "text/plain", "Preview not ready");
     return;
   }
+  // Copy under the short mutex and release it before the socket write. A slow
+  // browser must never stall the capture or MJPEG task.
+  size_t jpgLen = s_previewJpgLen;
+  uint8_t *jpgCopy = static_cast<uint8_t *>(ps_malloc(jpgLen));
+  if (!jpgCopy) jpgCopy = static_cast<uint8_t *>(malloc(jpgLen));
+  if (jpgCopy) memcpy(jpgCopy, s_previewJpg, jpgLen);
+  xSemaphoreGive(s_previewMutex);
+  if (!jpgCopy) {
+    server.send(503, "text/plain", "Preview buffer unavailable");
+    return;
+  }
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
-  server.setContentLength(s_previewJpgLen);
+  server.setContentLength(jpgLen);
   server.send(200, "image/jpeg", "");
-  server.sendContent(reinterpret_cast<const char *>(s_previewJpg), s_previewJpgLen);
-  xSemaphoreGive(s_previewMutex);
+  server.sendContent(reinterpret_cast<const char *>(jpgCopy), jpgLen);
+  free(jpgCopy);
 }
 
 void camHwStartStreamServer(uint16_t port) {

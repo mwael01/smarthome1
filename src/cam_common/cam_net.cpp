@@ -100,9 +100,7 @@ void startFallbackApLocked() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
-  IPAddress apIp = (s_source == SmartHomeNet::CAM_SOURCE_FACE)
-                       ? IPAddress(192, 168, 11, 1)
-                       : IPAddress(192, 168, 12, 1);
+  IPAddress apIp(192, 168, 11, 1);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.softAPConfig(apIp, apIp, subnet);
 
@@ -141,9 +139,7 @@ void camNetInit(SmartHomeNet::CamSource source) {
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.setAutoReconnect(true);
 
-  const uint8_t *ipArr = (source == SmartHomeNet::CAM_SOURCE_FACE)
-                             ? SmartHomeNet::FACE_CAM_IP
-                             : SmartHomeNet::PLATE_CAM_IP;
+  const uint8_t *ipArr = SmartHomeNet::FACE_CAM_IP;
   IPAddress localIp(ipArr[0], ipArr[1], ipArr[2], ipArr[3]);
   IPAddress hubIp(SmartHomeNet::HUB_IP[0], SmartHomeNet::HUB_IP[1],
                   SmartHomeNet::HUB_IP[2], SmartHomeNet::HUB_IP[3]);
@@ -203,8 +199,7 @@ void camNetLoop() {
 
   if (triggerImmediateHeartbeat || (now - s_lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)) {
     s_lastHeartbeatMs = now;
-    camNetSendEvent(SmartHomeNet::CAM_EVENT_HEARTBEAT, 0, 100,
-                    s_source == SmartHomeNet::CAM_SOURCE_FACE ? "FACE-CAM" : "PLATE-CAM");
+    camNetSendEvent(SmartHomeNet::CAM_EVENT_HEARTBEAT, 0, 100, "FACE-CAM");
   }
 }
 
@@ -280,7 +275,7 @@ bool camNetSendEvent(SmartHomeNet::CamEventType event,
   const uint8_t *targetMac = (WiFi.status() == WL_CONNECTED && s_hubPeerAdded)
                                  ? s_hubBssid
                                  : BROADCAST_MAC;
-  if (targetMac == BROADCAST_MAC) {
+  if (memcmp(targetMac, BROADCAST_MAC, sizeof(BROADCAST_MAC)) == 0) {
     ensurePeer(BROADCAST_MAC, WIFI_IF_STA);
   }
 
@@ -346,15 +341,11 @@ String camNetIpString() {
 }
 
 String camNetFallbackApSsid() {
-  return (s_source == SmartHomeNet::CAM_SOURCE_FACE)
-             ? String("SmartHome-FaceCam")
-             : String("SmartHome-PlateCam");
+  return String("SmartHome-FaceCam");
 }
 
 String camNetFallbackApIp() {
-  return (s_source == SmartHomeNet::CAM_SOURCE_FACE)
-             ? String("192.168.11.1")
-             : String("192.168.12.1");
+  return String("192.168.11.1");
 }
 
 String camNetMacString() {

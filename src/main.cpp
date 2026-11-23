@@ -9,10 +9,9 @@
 // 7- High-decibel swept-frequency siren alarm (passive buzzer -> GPIO25 via LEDC)
 // 8- High-power Wi-Fi SoftAP ("SmartHome-Net" 192.168.4.1) + optional Home Wi-Fi STA uplink
 // 9- Wireless ESP-NOW receiver for 2x ESP32-CAM nodes:
-//    - Camera 1 (Face Recognition @ 192.168.4.101) -> triggers door servo or intruder siren
-//    - Camera 2 (Plate OCR @ 192.168.4.102)        -> triggers car gate servos or intruder siren
+//    - Face camera stream -> laptop AI recognition -> door servo or intruder siren
 // 10- Modern Responsive Web Admin Panel:
-//    - Live side-by-side video feeds from both cameras (direct or Hub proxy)
+//    - Live face-camera video feed (direct or Hub proxy)
 //    - Real-time gauge meters and status badges for all sensors
 //    - Interactive gate, door, and siren controls
 //    - Persistent settings in NVS (Preferences) for thresholds, timers, and Wi-Fi credentials
@@ -132,7 +131,7 @@ struct HubConfig {
   bool smokeActiveLow      = true;  // Digital DO active level (LOW = Smoke, HIGH = Clean)
   bool voiceSpokenEnabled  = true;  // Natural spoken voice sentences vs musical chimes
   float ultrasonicDistCm   = 25.0f; // Proximity trigger threshold
-  unsigned long gateHoldMs = 5000;  // Duration gate stays open after recognized plate
+  unsigned long gateHoldMs = 8000;  // Duration gate stays open after authorized RFID
   unsigned long doorHoldMs = 3000;  // Duration door stays open after recognized face
   unsigned long camAlarmMs = 4000;  // Intruder alarm siren duration
   bool pirScheduleEnabled  = true;  // Filter PIR siren by night window (midnight to 7 AM)
@@ -218,7 +217,7 @@ unsigned long sirenTestUntilMs = 0;
 
 unsigned long lastUltrasonicMs = 0;
 unsigned long ultrasonicAlarmUntilMs = 0;
-unsigned long plateGateUntilMs = 0;
+unsigned long gateOpenUntilMs = 0;
 unsigned long doorOpenUntilMs = 0;
 unsigned long camAlarmUntilMs = 0;
 
@@ -381,7 +380,6 @@ struct CamNodeTelemetry {
 };
 
 CamNodeTelemetry faceCamState;
-CamNodeTelemetry plateCamState;
 
 // ESP-NOW Rx Queue
 struct IncomingCamPacket {
@@ -410,7 +408,7 @@ void loadConfigFromNvs() {
   g_cfg.smokeActiveLow       = prefs.getBool("smk_actlow", true);
   g_cfg.voiceSpokenEnabled   = prefs.getBool("v_spoken", true);
   g_cfg.ultrasonicDistCm     = prefs.getFloat("ultra_cm", 25.0f);
-  g_cfg.gateHoldMs           = prefs.getULong("gate_ms", 5000);
+  g_cfg.gateHoldMs           = prefs.getULong("gate_ms", 8000);
   g_cfg.doorHoldMs           = prefs.getULong("door_ms", 3000);
   g_cfg.camAlarmMs           = prefs.getULong("cam_ms", 4000);
   g_cfg.motionTriggersSiren  = prefs.getBool("mot_siren", true);
@@ -431,7 +429,7 @@ void loadConfigFromNvs() {
   prefs.end();
 
   g_cfg.ultrasonicDistCm = constrain(g_cfg.ultrasonicDistCm, 5.0f, 150.0f);
-  g_cfg.gateHoldMs = constrain(g_cfg.gateHoldMs, 1000UL, 30000UL);
+  g_cfg.gateHoldMs = constrain(g_cfg.gateHoldMs, 3000UL, 60000UL);
   g_cfg.doorHoldMs = constrain(g_cfg.doorHoldMs, 1000UL, 30000UL);
   g_cfg.camAlarmMs = constrain(g_cfg.camAlarmMs, 1000UL, 20000UL);
   g_cfg.pirStartHour = constrain(g_cfg.pirStartHour, 0, 23);
@@ -510,10 +508,10 @@ bool popCamPacket(IncomingCamPacket &out) {
 // Servo Helper Functions
 // ---------------------------------------------------------------------------
 int servoAngleToPulseUs(int angle) {
-  // Clamped to 160° maximum to maintain safety margin against motor stall and gear breakage
+  // Map the complete mechanical gate travel to the configured pulse range.
   int clamped = constrain(angle, 0, 160);
   long span = static_cast<long>(SERVO_MAX_US - SERVO_MIN_US);
-  return SERVO_MIN_US + static_cast<int>((clamped * span + 90L) / 180L);
+  return SERVO_MIN_US + static_cast<int>((clamped * span + 80L) / 160L);
 }
 
 bool attachGateServo(Servo &servo, int pin, int initialAngle, const char *label) {
@@ -581,7 +579,7 @@ void onVoiceCommandReceived(VoiceCommand cmd) {
       setDoorOpen(true);
       break;
     case CMD_OPEN_GATE:
-      plateGateUntilMs = millis() + g_cfg.gateHoldMs;
+      gateOpenUntilMs = millis() + g_cfg.gateHoldMs;
       setGateOpen(true);
       break;
     case CMD_SIREN_MUTE:
@@ -729,8 +727,8 @@ void updateUltrasonicSensor(unsigned long now) {
 
 void updateServosControl(unsigned long now) {
   if (gateOpen) {
-    if (plateGateUntilMs == 0 || static_cast<long>(plateGateUntilMs - now) <= 0) {
-      plateGateUntilMs = 0;
+    if (gateOpenUntilMs == 0 || static_cast<long>(gateOpenUntilMs - now) <= 0) {
+      gateOpenUntilMs = 0;
       setGateOpen(false);
     }
   }
@@ -821,9 +819,6 @@ void handleCamEvent(const IncomingCamPacket &item, unsigned long now) {
   if (pkt.source == SmartHomeNet::CAM_SOURCE_FACE) {
     telemetry = &faceCamState;
     srcName = "FACE-CAM";
-  } else if (pkt.source == SmartHomeNet::CAM_SOURCE_PLATE) {
-    // Car plate camera is disabled; RFID controls the car gate
-    return;
   } else {
     return;
   }
@@ -992,6 +987,14 @@ void handleApiCamEvent() {
   if (smartHomeJsonGetInt(body, "seq", intVal) && intVal >= 0) seq = static_cast<uint32_t>(intVal);
   smartHomeJsonGetString(body, "label", label, sizeof(label));
 
+  if (source != SmartHomeNet::CAM_SOURCE_FACE ||
+      (event != SmartHomeNet::CAM_EVENT_RECOGNIZED &&
+       event != SmartHomeNet::CAM_EVENT_UNKNOWN &&
+       event != SmartHomeNet::CAM_EVENT_HEARTBEAT)) {
+    server.send(400, "application/json", "{\"error\":\"unsupported camera event\"}");
+    return;
+  }
+
   SmartHomeNet::CamEventPacket pkt = {};
   pkt.magic = SmartHomeNet::PACKET_MAGIC;
   pkt.source = static_cast<uint8_t>(source);
@@ -1018,7 +1021,6 @@ void handleApiStatus() {
   bool camAlarmActive = (camAlarmUntilMs != 0 && static_cast<long>(camAlarmUntilMs - now) > 0);
   bool sirenTestActive = (sirenTestUntilMs != 0 && static_cast<long>(sirenTestUntilMs - now) > 0);
   bool faceOnline = faceCamState.seen && (now - faceCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
-  bool plateOnline = plateCamState.seen && (now - plateCamState.lastSeenMs <= CAM_ONLINE_TIMEOUT_MS);
 
   time_t nowClock = time(nullptr);
   struct tm ti;
@@ -1099,13 +1101,6 @@ void handleApiStatus() {
           ",\"ageSec\":" + String(faceCamState.seen ? ((now - faceCamState.lastSeenMs) / 1000) : 9999) +
           ",\"eventAgeSec\":" + String(faceCamState.lastEventMs > 0 ? ((now - faceCamState.lastEventMs) / 1000) : 9999) + "},";
 
-  json += "\"plateCam\":{\"online\":" + String(plateOnline ? "true" : "false") +
-          ",\"event\":\"" + String(eventTypeName(plateCamState.lastEvent)) + "\"" +
-          ",\"id\":" + String(plateCamState.lastMatchId) +
-          ",\"conf\":" + String(plateCamState.lastConfidence) +
-          ",\"label\":\"" + smartHomeJsonEscape(plateCamState.lastLabel) + "\"" +
-          ",\"ageSec\":" + String(plateCamState.seen ? ((now - plateCamState.lastEventMs) / 1000) : 9999) + "},";
-
   // RFID Telemetry
   json += "\"rfid\":{";
   json += "\"online\":" + String(rfidOnline ? "true" : "false") + ",";
@@ -1183,11 +1178,11 @@ void handleApiControl() {
   unsigned long now = millis();
 
   if (action == "gate_open") {
-    plateGateUntilMs = now + g_cfg.gateHoldMs;
+    gateOpenUntilMs = now + g_cfg.gateHoldMs;
     setGateOpen(true);
     addEventLog("info", "Manual control: Car gate opened");
   } else if (action == "gate_close") {
-    plateGateUntilMs = 0;
+    gateOpenUntilMs = 0;
     setGateOpen(false);
     addEventLog("info", "Manual control: Car gate closed");
   } else if (action == "door_open") {
@@ -1520,11 +1515,11 @@ void handleRoot() {
     <!-- Camera 1: Face Recognition -->
     <div class="card">
       <div class="card-title">
-        <span>Camera 1: Face Recognition (HW-297)</span>
+        <span>Face Camera: ESP32-S3 Stream + Laptop AI</span>
         <span id="cam1Status" class="badge b-off">CONNECTING...</span>
       </div>
       <div class="cam-box">
-        <img id="cam1Img" class="cam-img" alt="Camera 1 Face Recognition Stream">
+        <img id="cam1Img" class="cam-img" alt="ESP32-S3 Face Camera Stream">
         <div class="cam-overlay">
           <span id="cam1Tag" class="badge b-off">NO FACE</span>
           <span id="cam1Fps" style="background:rgba(0,0,0,0.6);padding:2px 6px;border-radius:4px;font-size:.72rem">-- ms</span>
@@ -1537,7 +1532,7 @@ void handleRoot() {
       <div class="cam-actions">
         <button onclick="triggerAction('door_open')">🔓 Unlock Door (Servo 3)</button>
         <button class="secondary" onclick="triggerAction('door_close')">🔒 Lock Door</button>
-        <a id="cam1LinkBtn" class="btn secondary" href="http://192.168.4.101/" target="_blank">Open Face UI ↗</a>
+        <a id="cam1LinkBtn" class="btn secondary" href="http://192.168.4.101/" target="_blank">Open Camera UI ↗</a>
       </div>
     </div>
 
@@ -2396,7 +2391,6 @@ void setup() {
   server.on("/api/wifi", HTTP_POST, handleApiWifi);
   server.on("/api/cam/event", HTTP_POST, handleApiCamEvent);
   server.on("/api/cam/1/preview.jpg", HTTP_GET, []() { handleCamProxy(1); });
-  server.on("/api/cam/2/preview.jpg", HTTP_GET, []() { handleCamProxy(2); });
   server.begin();
 
   addEventLog("info", "Smart Home Hub started. Web Admin ready.");
@@ -2453,10 +2447,9 @@ void loop() {
     }
   }
 
-  // 4c. RFID card reader — controls main car gate (Servos 1 & 2 to 160°)
-  // Skip SPI polling while gate servos are actively sweeping to avoid RF/SPI + motor inrush overlap
-  bool gateServosMoving = (currentServo1Angle != targetServo1Angle) || (currentServo2Angle != targetServo2Angle);
-  if (rfidOnline && !gateServosMoving && rfid.PICC_IsNewCardPresent()) {
+  // 4c. RFID card reader — controls main car gate (Servos 1 & 2 to 160°).
+  // Poll during the servo ramp so access events are handled immediately.
+  if (rfidOnline && rfid.PICC_IsNewCardPresent()) {
     if (rfid.PICC_ReadCardSerial()) {
       String uid;
       for (byte i = 0; i < rfid.uid.size; i++) {
@@ -2468,7 +2461,7 @@ void loop() {
       lastRfidUid = uid;
 
       if (uid == ACCEPTED_RFID_UID) {
-        plateGateUntilMs = millis() + g_cfg.gateHoldMs;
+        gateOpenUntilMs = millis() + g_cfg.gateHoldMs;
         setGateOpen(true);
         if (shouldLog) {
           lastRfidPrintMs = now;
