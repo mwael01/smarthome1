@@ -299,11 +299,13 @@ class LaptopFaceBridge:
         engine: FastFaceEngine,
         show_gui: bool = True,
         feedback_interval_s: float = 0.35,
+        laptop_model: str = "Laptop-AI",
     ):
         self.client = client
         self.engine = engine
         self.show_gui = show_gui
         self.feedback_interval_s = feedback_interval_s
+        self.laptop_model = laptop_model
 
         self.last_status: dict = {}
         self.last_feedback_time = 0.0
@@ -369,6 +371,61 @@ class LaptopFaceBridge:
             except Exception:
                 pass
             time.sleep(1.5)
+
+    def step_once(self) -> Optional[dict]:
+        """Analyze the latest frame once and return the camera response.
+
+        This synchronous entry point is useful for integration tests and for
+        headless callers. The production loop below uses the same feedback API
+        and keeps its reconnecting reader thread.
+        """
+        with self._jpg_lock:
+            jpg_bytes = self._latest_jpg
+        if jpg_bytes is None:
+            return None
+
+        # Keep the synchronous path equivalent to the background sync thread.
+        # This also makes dashboard commands deterministic in integration tests.
+        try:
+            self.last_status = self.client.get_status()
+        except Exception:
+            pass
+
+        if callable(self.engine) and not hasattr(self.engine, "analyze_frame"):
+            verdict = self.engine(jpg_bytes, self.last_status)
+        else:
+            arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                return None
+            verdict = self.engine.analyze_frame(frame)
+
+        if verdict.get("enrollCaptured") and self.last_status.get("enrollPending"):
+            target_name = str(self.last_status.get("enrollTargetName") or "User")
+            enrolled = self.last_status.get("enrolled") or []
+            new_id = max((int(item.get("id", -1)) for item in enrolled), default=-1) + 1
+            return self.client.ack_enroll(True, new_id, target_name, "Enrolled via Laptop AI")
+
+        pending_action = self.last_status.get("pendingAction")
+        if pending_action in ("delete", "clear"):
+            self.client.ack_command(int(self.last_status.get("pendingActionSeq", 0)))
+            self.last_status = self.client.get_status()
+
+        result = verdict.get("result", "no_face")
+        response = self.client.send_result(
+            result=result,
+            match_id=verdict.get("matchId", -1),
+            name=verdict.get("name", "---"),
+            confidence=verdict.get("confidence", 0.0),
+            face_detected=verdict.get("faceDetected", False),
+            face_quality=verdict.get("faceQuality", "NO_FACE"),
+            box=verdict.get("box", [0, 0, 0, 0]),
+            inference_ms=verdict.get("inferenceMs", 0),
+            laptop_model=self.laptop_model,
+        )
+        self.last_feedback_time = time.time()
+        self.last_result_sent = result
+        return response
 
     def draw_hud(self, bgr_img: np.ndarray, verdict: dict, fps: float) -> np.ndarray:
         frame = bgr_img.copy()
@@ -496,7 +553,7 @@ class LaptopFaceBridge:
                             face_quality=verdict.get("faceQuality", "NO_FACE"),
                             box=verdict.get("box", [0, 0, 0, 0]),
                             inference_ms=verdict.get("inferenceMs", 0),
-                            laptop_model="Laptop-Dlib-ResNet",
+                            laptop_model=self.laptop_model,
                         )
                         self.last_feedback_time = now
                         self.last_result_sent = result_str
