@@ -82,7 +82,7 @@ For an external light, use a driver with a 3.3 V-compatible active-high PWM inpu
 
 ## Build & Upload (PlatformIO)
 
-[`platformio.ini`](platformio.ini) defines three firmware targets:
+[`platformio.ini`](platformio.ini) defines the firmware targets:
 
 ```bash
 # Build all firmwares at once
@@ -123,6 +123,8 @@ pio device monitor -b 115200
 3. Close the preview before measuring single-client speed. Run `python3 tools/test_camera_stream.py` on the laptop. It checks 120 consecutive JPEGs and reports time to first frame, received FPS, and JPEG throughput.
 4. Compare VGA and QVGA in the dashboard settings. QVGA uses less bandwidth. VGA gives the laptop AI more detail. Repeat the speed test after changing the resolution or JPEG quality.
 5. For a laptop AI preview on this hotspot, run `python3 tools/laptop_face_bridge.py --ip 192.168.11.1`. Flash `cam_face_stream_s3` when you are ready to reconnect the camera to the hub.
+
+For a camera board with the Nulllab-compatible onboard flashlight circuit, use `pio run -e cam_face_stream_s3_standalone_gpio3 -t upload`. Open `http://192.168.11.1`, turn off Auto Flash, and raise Flash LED Brightness slightly to check the white light. GPIO3 is an active-high flashlight output on that circuit. Compare your board with the vendor layout before using this target. [Nulllab board layout and pinout](https://github.com/nulllaborg/esp32s3-cam#hardware) · [Nulllab schematic](https://github.com/nulllaborg/esp32s3-cam/blob/main/esp32s3_cam_sch.pdf)
 
 ---
 
