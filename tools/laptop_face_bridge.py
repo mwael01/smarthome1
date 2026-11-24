@@ -315,6 +315,7 @@ class LaptopFaceBridge:
 
         self._stop = threading.Event()
         self._latest_jpg: Optional[bytes] = None
+        self._latest_frame_at = 0.0
         self._jpg_lock = threading.Lock()
 
     def stop(self):
@@ -328,6 +329,7 @@ class LaptopFaceBridge:
                         break
                     with self._jpg_lock:
                         self._latest_jpg = jpg
+                        self._latest_frame_at = time.monotonic()
                         self.frames_count += 1
             except Exception as exc:
                 if not self._stop.is_set():
@@ -509,18 +511,23 @@ class LaptopFaceBridge:
         if self.show_gui:
             cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
-        last_verdict = {"result": "no_face", "faceDetected": False}
-        current_bgr = None
+        last_frame_number = 0
 
         try:
             while not self._stop.is_set():
                 with self._jpg_lock:
                     jpg_bytes = self._latest_jpg
+                    frame_number = self.frames_count
+                    frame_at = self._latest_frame_at
 
-                if jpg_bytes is None:
-                    time.sleep(0.02)
+                if (jpg_bytes is None or frame_number == last_frame_number
+                        or time.monotonic() - frame_at > 1.0):
+                    if self.show_gui and (cv2.waitKey(1) & 0xFF) in (27, ord('q'), ord('Q')):
+                        break
+                    self._stop.wait(0.02)
                     continue
 
+                last_frame_number = frame_number
                 arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
                 current_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if current_bgr is None:
@@ -528,7 +535,6 @@ class LaptopFaceBridge:
 
                 # Run multi-scale AI face recognition
                 verdict = self.engine.analyze_frame(current_bgr)
-                last_verdict = verdict
 
                 now = time.time()
                 fps_frame_counter += 1

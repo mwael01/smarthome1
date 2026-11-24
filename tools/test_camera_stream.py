@@ -18,6 +18,7 @@ def measure(url, frame_count):
             raise ValueError("expected a multipart MJPEG stream")
         delimiter = b"--" + boundary.encode("ascii")
         payload_bytes = 0
+        longest_gap = 0.0
         for frame in range(frame_count):
             if stream.readline(256).rstrip(b"\r\n") != delimiter:
                 raise ValueError(f"missing multipart boundary at frame {frame + 1}")
@@ -29,15 +30,19 @@ def measure(url, frame_count):
             if (len(jpeg) != size or jpeg[:2] != b"\xff\xd8" or jpeg[-2:] != b"\xff\xd9"
                     or stream.read(2) != b"\r\n"):
                 raise ValueError(f"incomplete JPEG at frame {frame + 1}")
+            received = time.monotonic()
             if frame == 0:
-                first_frame = time.monotonic()
+                first_frame = received
             else:
                 payload_bytes += size
+                longest_gap = max(longest_gap, received - previous_frame)
+            previous_frame = received
 
-    elapsed = time.monotonic() - first_frame
+    elapsed = previous_frame - first_frame
     print(f"First frame: {(first_frame - started) * 1000:.0f} ms")
     print(f"{frame_count} valid JPEGs | {(frame_count - 1) / elapsed:.1f} FPS | "
           f"{payload_bytes * 8 / elapsed / 1e6:.2f} Mbit/s JPEG payload")
+    print(f"Longest gap between frames: {longest_gap * 1000:.0f} ms")
 
 
 def main():

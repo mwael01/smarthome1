@@ -126,6 +126,12 @@ pio device monitor -b 115200
 
 For a camera board with the Nulllab-compatible onboard flashlight circuit, use `pio run -e cam_face_stream_s3_standalone_gpio3 -t upload`. Open `http://192.168.11.1`, turn off Auto Flash, and raise Flash LED Brightness slightly to check the white light. GPIO3 is an active-high flashlight output on that circuit. Compare your board with the vendor layout before using this target. [Nulllab board layout and pinout](https://github.com/nulllaborg/esp32s3-cam#hardware) · [Nulllab schematic](https://github.com/nulllaborg/esp32s3-cam/blob/main/esp32s3_cam_sch.pdf)
 
+### Streaming with the hub
+
+Flash `cam_face_stream_s3` for hub operation, or `cam_face_stream_s3_gpio3` if you verified the white flashlight on GPIO3. Connect the laptop to `SmartHome-Net`, then run `python3 tools/laptop_face_bridge.py`. The camera dashboard is at `http://192.168.4.101`.
+
+For a throughput comparison, run `python3 tools/test_camera_stream.py --url http://192.168.4.101:81/stream --frames 300` with the laptop AI and extra preview tabs closed. Repeat with the hub dashboard open to measure the effect of an extra viewer. If the stream stutters, compare HVGA or QVGA with VGA in the camera dashboard at the same distance and lighting.
+
 ---
 
 ## Project Structure

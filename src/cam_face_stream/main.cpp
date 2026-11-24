@@ -39,7 +39,6 @@ constexpr unsigned long REMOTE_FACE_HOLD_MS = 2200;
 constexpr unsigned long AUTO_FLASH_HOLD_MS = 5000;
 constexpr unsigned long FLASH_SETTLE_BLANK_MS = 800;
 constexpr float DARKNESS_LUMA_THRESH = 0.22f;
-constexpr float DAYLIGHT_LUMA_THRESH = 0.68f;
 constexpr uint16_t STREAM_PORT = 81;
 constexpr uint8_t DEFAULT_AUTO_FLASH_DUTY = 64;
 constexpr size_t MAX_MOTION_JPG_BUF = 96 * 1024;
@@ -449,7 +448,9 @@ void camCaptureTask(void * /*param*/) {
                      fb->buf != nullptr &&
                      fb->len >= 128 &&
                      fb->buf[0] == 0xFF &&
-                     fb->buf[1] == 0xD8);
+                     fb->buf[1] == 0xD8 &&
+                     fb->buf[fb->len - 2] == 0xFF &&
+                     fb->buf[fb->len - 1] == 0xD9);
     bool validRgb = (fb->format == PIXFORMAT_RGB565 &&
                      fb->buf != nullptr &&
                      fb->len >= 256);
@@ -544,8 +545,8 @@ void camCaptureTask(void * /*param*/) {
                         sceneLuma, motionNow ? 1 : 0, remoteFacePresent ? 1 : 0);
         }
       } else {
-        if (((now - lastActivityMs) >= AUTO_FLASH_HOLD_MS) ||
-            (sceneLuma > DAYLIGHT_LUMA_THRESH && !enrollActive)) {
+        // Luma measured with the flash on includes its own light.
+        if (now - lastActivityMs >= AUTO_FLASH_HOLD_MS) {
           flashOn = false;
           flashSettleUntilMs = now + FLASH_SETTLE_BLANK_MS;
           camHwSetFlashLed(0);
@@ -1536,6 +1537,7 @@ void handleRoot() {
 let currentMode = 'mjpeg';
 let mjpegFails = 0;
 let snapshotActive = false;
+let mjpegRetryTimer = null;
 let cfgLoaded = false;
 let clientFrames = 0;
 let lastFpsTs = performance.now();
@@ -1577,6 +1579,7 @@ function initCamera() {
         }, 600);
       } else {
         setStreamMode('snapshot');
+        mjpegRetryTimer = setTimeout(() => setStreamMode('mjpeg'), 10000);
       }
     }
   };
@@ -1585,11 +1588,13 @@ function initCamera() {
 }
 
 function setStreamMode(mode) {
+  clearTimeout(mjpegRetryTimer);
   currentMode = mode;
   const img = document.getElementById('cam');
   const btn = document.getElementById('stream-mode-btn');
   const pill = document.getElementById('hud-stream-text');
   if (mode === 'mjpeg') {
+    mjpegFails = 0;
     snapshotActive = false;
     btn.textContent = 'Mode: MJPEG';
     pill.textContent = 'STREAMING :81';

@@ -1856,6 +1856,7 @@ let cfgLoaded = false;
 let cam1MjpegActive = false;
 let cam1MjpegFrames = 0;
 let cam1LastFpsTs = performance.now();
+let cam1RetryAt = 0;
 
 // Auto-refresh camera frames with direct stream support (without leaking extra MJPEG client slots)
 function streamCam(camId, imgId, badgeId, perfId, tagId){
@@ -1888,6 +1889,7 @@ function streamCam(camId, imgId, badgeId, perfId, tagId){
       cam1MjpegActive = false;
       img.onload = null;
       img.onerror = null;
+      cam1RetryAt = performance.now() + 10000;
       pollSnapshot(camId, imgId, badgeId, perfId);
     };
     img.src = "http://192.168.4.101:81/stream?t=" + Date.now();
@@ -1897,6 +1899,11 @@ function streamCam(camId, imgId, badgeId, perfId, tagId){
 
 function pollSnapshot(camId, imgId, badgeId, perfId){
   if (cam1MjpegActive) return;
+  if (cam1RetryAt && performance.now() >= cam1RetryAt) {
+    cam1RetryAt = 0;
+    streamCam(camId, imgId, badgeId, perfId);
+    return;
+  }
   const img = document.getElementById(imgId);
   const next = new Image();
   const t0 = performance.now();
