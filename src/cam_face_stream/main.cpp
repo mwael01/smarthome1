@@ -720,7 +720,10 @@ void handleRecognitionResult() {
     strcpy(displayResult, "RECOGNIZED");
     camHwSetStatusLed(true);
 
-    if (triggerHub && (forceDispatch || (now - g_lastRecognizedSentMs >= RECOGNIZED_COOLDOWN_MS))) {
+    if (triggerHub && !camNetHubConnected()) {
+      hubAction = "HUB_OFFLINE";
+    } else if (triggerHub && (forceDispatch || g_lastRecognizedSentMs == 0 ||
+                              now - g_lastRecognizedSentMs >= RECOGNIZED_COOLDOWN_MS)) {
       g_lastRecognizedSentMs = now;
       hubDispatched = camNetSendEvent(SmartHomeNet::CAM_EVENT_RECOGNIZED,
                                       static_cast<int16_t>(matchId),
@@ -729,7 +732,7 @@ void handleRecognitionResult() {
       hubAction = "DOOR_OPEN";
       Serial.printf("[REMOTE] RECOGNIZED id=%d name=\"%s\" sim=%.2f -> Hub Door Open (%s)\n",
                     matchId, cleanName, sim, hubDispatched ? "OK" : "ERR");
-    } else {
+    } else if (triggerHub) {
       hubAction = "COOLDOWN";
     }
   } else if (isUnknown) {
@@ -742,8 +745,11 @@ void handleRecognitionResult() {
 
     if (g_unknownStreak >= activeCfg.unknownConfirm || forceDispatch) {
       strcpy(displayResult, "UNKNOWN");
-      if (triggerHub && activeCfg.armed &&
-          (forceDispatch || (now - g_lastUnknownSentMs >= UNKNOWN_COOLDOWN_MS))) {
+      if (triggerHub && activeCfg.armed && !camNetHubConnected()) {
+        hubAction = "HUB_OFFLINE";
+      } else if (triggerHub && activeCfg.armed &&
+                 (forceDispatch || g_lastUnknownSentMs == 0 ||
+                  now - g_lastUnknownSentMs >= UNKNOWN_COOLDOWN_MS)) {
         g_lastUnknownSentMs = now;
         hubDispatched = camNetSendEvent(SmartHomeNet::CAM_EVENT_UNKNOWN,
                                         -1,
@@ -752,7 +758,7 @@ void handleRecognitionResult() {
         hubAction = "INTRUDER_ALARM";
         Serial.printf("[REMOTE] UNKNOWN INTRUDER (streak=%d sim=%.2f) -> Hub Alarm (%s)\n",
                       g_unknownStreak, sim, hubDispatched ? "OK" : "ERR");
-      } else {
+      } else if (triggerHub) {
         hubAction = activeCfg.armed ? "COOLDOWN" : "DISARMED";
       }
     } else {
@@ -869,6 +875,8 @@ void handleEnrollAck() {
 
   char errMsg[64] = "Enroll failed on Laptop";
   readStrParam(body, "msg", errMsg, sizeof(errMsg));
+  bool triggerHub = true;
+  readBoolParam(body, "triggerHub", triggerHub);
 
   g_lastLaptopFeedbackMs = millis();
   bool hubSent = false;
@@ -894,7 +902,7 @@ void handleEnrollAck() {
     xSemaphoreGive(stateMutex);
   }
 
-  if (ok && newId >= 0) {
+  if (ok && newId >= 0 && triggerHub && camNetHubConnected()) {
     g_lastRecognizedSentMs = millis();
     hubSent = camNetSendEvent(SmartHomeNet::CAM_EVENT_RECOGNIZED,
                               static_cast<int16_t>(newId),
@@ -1436,8 +1444,8 @@ void handleRoot() {
       </div>
 
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
-        <button class="success" onclick="testDoor(1)" style="justify-content:center">Test Door Open</button>
-        <button class="danger" onclick="testDoor(0)" style="justify-content:center">Test Intruder Siren</button>
+        <button class="success" id="test-door" onclick="testDoor(1)" style="justify-content:center" disabled>Test Door Open</button>
+        <button class="danger" id="test-siren" onclick="testDoor(0)" style="justify-content:center" disabled>Test Intruder Siren</button>
       </div>
 
       <div class="api-box">
@@ -1671,6 +1679,8 @@ async function refreshStatus() {
     const hub = document.getElementById('hub-badge');
     hub.textContent = d.hubConnected ? ('HUB: ' + d.ip) : (d.fallbackAp ? 'STANDALONE AP' : 'CONNECTING...');
     hub.className = 'badge ' + (d.hubConnected ? 'ok' : 'warn');
+    document.getElementById('test-door').disabled = !d.hubConnected;
+    document.getElementById('test-siren').disabled = !d.hubConnected;
 
     document.getElementById('status-storage-info').textContent =
       (d.frameWidth || 640) + 'x' + (d.frameHeight || 480) + ' | ' + d.fps.toFixed(1) + ' FPS | ' + d.feedbackCount + ' Laptop events';
@@ -1856,8 +1866,9 @@ async function saveSettings() {
 }
 
 async function testDoor(ok) {
-  await fetch('/api/test?ok=' + ok, { method: 'POST' });
-  showToast(ok ? 'Triggered Valid Door Opening' : 'Triggered Intruder Siren Alert');
+  const r = await fetch('/api/test?ok=' + ok, { method: 'POST' });
+  const d = await r.json();
+  showToast(d.sent ? 'Test sent to hub' : 'Hub test unavailable');
 }
 
 initCamera();

@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import urllib.request
+from contextlib import closing
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
@@ -275,6 +276,26 @@ def run_tests():
             "Config resolution HVGA updated frameWidth=480, frameHeight=320",
             cam_st["frameWidth"] == 480 and cam_st["frameHeight"] == 320 and cam_st["cfg"]["jpegQuality"] == 15,
         )
+
+        hub_proc.terminate()
+        hub_proc.wait()
+        standalone = EspCamStreamClient("127.0.0.1", 8081, 8082, standalone=True)
+        log_test("Standalone mode defaults to the hotspot IP",
+                 EspCamStreamClient(standalone=True).cam_ip == "192.168.11.1")
+        with closing(standalone.iter_mjpeg_frames()) as frames:
+            jpeg = next(frames)
+        result = standalone.send_result("recognized", match_id=0, name="Local Match",
+                                        face_detected=True, box=[10, 20, 80, 90], force=True)
+        status = standalone.get_status()
+        log_test("Standalone stream and local recognition work with the hub stopped",
+                 jpeg.startswith(b"\xff\xd8") and result["ok"] and not result["hubDispatched"]
+                 and result["hubAction"] == "none"
+                 and status["laptopConnected"] and status["lastMatchName"] == "Local Match"
+                 and status["faceBox"] == [10, 20, 80, 90])
+        enrollment = standalone.ack_enroll(True, 5, "Standalone Profile")
+        log_test("Standalone enrollment updates the camera without a hub event",
+                 enrollment["ok"] and not enrollment["hubDispatched"]
+                 and any(e["id"] == 5 for e in standalone.get_status()["enrolled"]))
 
     finally:
         cam_proc.terminate()

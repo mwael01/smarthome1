@@ -403,7 +403,7 @@ def make_http_handler(cam: StreamCamState):
                             cam.last_recognized_sent = now
                             send_event_args = (CAM_EVENT_RECOGNIZED, match_id, conf_pct, name)
                             hub_action = "DOOR_OPEN"
-                        else:
+                        elif trigger_hub:
                             hub_action = "COOLDOWN"
                     elif is_unk:
                         match_id = -1
@@ -416,7 +416,7 @@ def make_http_handler(cam: StreamCamState):
                                 cam.last_unknown_sent = now
                                 send_event_args = (CAM_EVENT_UNKNOWN, -1, conf_pct, "UNKNOWN")
                                 hub_action = "INTRUDER_ALARM"
-                            else:
+                            elif trigger_hub:
                                 hub_action = "COOLDOWN" if cam.cfg["armed"] else "DISARMED"
                         else:
                             display_res = "VERIFYING"
@@ -507,6 +507,7 @@ def make_http_handler(cam: StreamCamState):
                 new_id = int(self._param(qs, body, "id", 0))
                 name = str(self._param(qs, body, "name", cam.enroll_target_name or "User"))[:23]
                 msg = str(self._param(qs, body, "msg", "Enroll failed on Laptop"))
+                trigger_hub = self._param(qs, body, "triggerHub", True) in (True, 1, "1", "true", "True")
                 with cam.lock:
                     cam.last_laptop_ms = now
                     cam.laptop_connected = True
@@ -521,7 +522,9 @@ def make_http_handler(cam: StreamCamState):
                         cam.last_result = "RECOGNIZED"
                     else:
                         cam.enroll_message = msg
-                hub_sent = cam.send_dual_path_event(CAM_EVENT_RECOGNIZED, new_id, 100, name) if (ok and new_id >= 0) else False
+                hub_sent = False
+                if ok and new_id >= 0 and trigger_hub:
+                    hub_sent = cam.send_dual_path_event(CAM_EVENT_RECOGNIZED, new_id, 100, name)
                 self._send_json(200, {"ok": ok, "hubDispatched": hub_sent})
                 return
 

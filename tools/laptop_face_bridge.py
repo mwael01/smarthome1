@@ -4,8 +4,8 @@ Laptop Face Recognition Bridge for Smart Home Camera 1 (cam_face_stream firmware
 
 Connects to the ESP32-CAM MJPEG stream (:81/stream), runs high-speed real-time face
 detection and recognition on the laptop CPU/GPU, displays a live GUI HUD preview,
-and sends recognition results back to the ESP32-CAM (POST /api/recognition/result)
-to immediately trigger Main Hub door unlock or intruder siren.
+and sends recognition results back to the ESP32-CAM (POST /api/recognition/result).
+Standalone mode displays the results locally. Hub mode can forward access events.
 
 Features:
 - Instant multi-scale face detection & MobileFaceNet/dlib embedding matching (<25 ms).
@@ -16,13 +16,11 @@ Features:
 """
 
 import argparse
-import io
 import json
 import os
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
@@ -35,10 +33,14 @@ import numpy as np
 class EspCamStreamClient:
     """HTTP control & MJPEG stream client for the cam_face_stream ESP32-CAM node."""
 
-    def __init__(self, cam_ip: str = "192.168.4.101", http_port: int = 80, stream_port: int = 81):
+    def __init__(self, cam_ip: Optional[str] = None, http_port: int = 80,
+                 stream_port: int = 81, *, standalone: bool = False):
+        cam_ip = cam_ip or ("192.168.11.1" if standalone else "192.168.4.101")
         self.cam_ip = cam_ip
+        self.standalone = standalone or cam_ip == "192.168.11.1"
         self.base_url = f"http://{cam_ip}:{http_port}"
         self.stream_url = f"http://{cam_ip}:{stream_port}/stream"
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def _post_json(self, path: str, payload: Optional[dict] = None, timeout: float = 1.5) -> dict:
         data = json.dumps(payload or {}).encode("utf-8")
@@ -48,11 +50,11 @@ class EspCamStreamClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with self._opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def get_status(self, timeout: float = 1.5) -> dict:
-        with urllib.request.urlopen(f"{self.base_url}/api/status", timeout=timeout) as resp:
+        with self._opener.open(f"{self.base_url}/api/status", timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def send_result(
@@ -79,7 +81,7 @@ class EspCamStreamClient:
             "box": box or [0, 0, 0, 0],
             "inferenceMs": int(inference_ms),
             "laptopModel": laptop_model,
-            "triggerHub": bool(trigger_hub),
+            "triggerHub": bool(trigger_hub and not self.standalone),
             "force": bool(force),
         }
         return self._post_json("/api/recognition/result", payload)
@@ -90,7 +92,8 @@ class EspCamStreamClient:
     def ack_enroll(self, ok: bool, face_id: int, name: str, msg: str = "") -> dict:
         return self._post_json(
             "/api/enroll/ack",
-            {"ok": bool(ok), "id": int(face_id), "name": name, "msg": msg},
+            {"ok": bool(ok), "id": int(face_id), "name": name, "msg": msg,
+             "triggerHub": not self.standalone},
         )
 
     def ack_command(self, seq: int) -> dict:
@@ -99,7 +102,7 @@ class EspCamStreamClient:
     def iter_mjpeg_frames(self, timeout: float = 5.0):
         """Yield raw JPEG byte buffers from the ESP32-CAM multipart MJPEG stream."""
         req = urllib.request.Request(self.stream_url)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with self._opener.open(req, timeout=timeout) as resp:
             buf = bytearray()
             while True:
                 chunk = resp.read1(8192)
@@ -455,10 +458,10 @@ class LaptopFaceBridge:
             left, top, right, bottom = box
             if result == "recognized":
                 color = (0, 255, 0)      # Bright Green = Authorized
-                tag = f"AUTHORIZED: {name.upper()} ({int(conf * 100)}%) -> UNLOCKING DOOR"
+                tag = f"RECOGNIZED: {name.upper()} ({int(conf * 100)}%)"
             elif result == "unknown":
                 color = (0, 0, 255)      # Red = Unknown Intruder
-                tag = f"UNKNOWN FACE (INTRUDER ALERT) ({int(conf * 100)}%)"
+                tag = f"UNKNOWN FACE ({int(conf * 100)}%)"
             else:
                 color = (0, 255, 255)    # Yellow = Aligning / Unregistered
                 tag = f"DETECTED FACE (Press 'e' to enroll)"
@@ -553,7 +556,7 @@ class LaptopFaceBridge:
 
                 if should_send:
                     try:
-                        self.client.send_result(
+                        response = self.client.send_result(
                             result=result_str,
                             match_id=verdict.get("matchId", -1),
                             name=verdict.get("name", "---"),
@@ -564,15 +567,15 @@ class LaptopFaceBridge:
                             inference_ms=verdict.get("inferenceMs", 0),
                             laptop_model=self.laptop_model,
                         )
-                        self.last_feedback_time = now
+                        if response.get("hubDispatched"):
+                            print(f"[AI-MATCH] Sent {response.get('hubAction')} to the hub")
+                        elif result_str != self.last_result_sent and result_str in ("recognized", "unknown"):
+                            print(f"[AI-MATCH] {result_str.upper()}: {verdict.get('name', 'Unknown')}")
                         self.last_result_sent = result_str
-
-                        if result_str == "recognized":
-                            print(f"[AI-MATCH] RECOGNIZED: {verdict.get('name')} ({int(verdict.get('confidence', 0)*100)}%) -> Door Unlocked!")
-                        elif result_str == "unknown":
-                            print(f"[AI-MATCH] UNKNOWN PERSON DETECTED -> Intruder Siren Triggered")
-                    except Exception as e:
-                        pass
+                    except (OSError, ValueError) as exc:
+                        print(f"[LAPTOP-AI] Camera feedback failed: {exc}", file=sys.stderr)
+                    finally:
+                        self.last_feedback_time = now
 
                 # Check if dashboard triggered an enrollment
                 if self.last_status.get("enrollPending") and verdict.get("faceDetected"):
@@ -621,7 +624,9 @@ class LaptopFaceBridge:
 
 def main():
     parser = argparse.ArgumentParser(description="High-Speed Laptop Face Recognition Bridge for ESP32-CAM")
-    parser.add_argument("--ip", default="192.168.4.101", help="ESP32-CAM IP address (default: 192.168.4.101)")
+    parser.add_argument("--standalone", action="store_true",
+                        help="Use the camera hotspot at 192.168.11.1 and keep results local")
+    parser.add_argument("--ip", help="Override the camera IP (hub mode defaults to 192.168.4.101)")
     parser.add_argument("--http-port", type=int, default=80, help="ESP32-CAM HTTP control port (default: 80)")
     parser.add_argument("--stream-port", type=int, default=81, help="ESP32-CAM MJPEG stream port (default: 81)")
     parser.add_argument("--faces-dir", default=os.path.join(os.path.dirname(__file__), "known_faces"),
@@ -631,7 +636,7 @@ def main():
     parser.add_argument("--no-gui", action="store_true", help="Run in headless background mode without OpenCV window")
     args = parser.parse_args()
 
-    client = EspCamStreamClient(args.ip, args.http_port, args.stream_port)
+    client = EspCamStreamClient(args.ip, args.http_port, args.stream_port, standalone=args.standalone)
     engine = FastFaceEngine(args.faces_dir, distance_thresh=args.thresh)
     bridge = LaptopFaceBridge(client, engine, show_gui=not args.no_gui)
 
