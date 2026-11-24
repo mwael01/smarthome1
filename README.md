@@ -134,6 +134,34 @@ Compare received FPS and the longest gap between frames at each resolution. Repe
 
 To identify the white flashlight's control pin, run `python3 tools/identify_flash_gpio.py`. The script guides unpowered multimeter measurements and flags pins shared with boot, memory, camera, USB, or UART signals. It uses the readings you enter and requires no connection to the ESP. A continuity match identifies a connection to the selected control point. Verify the circuit and active level before configuring a firmware output. [Espressif GPIO restrictions](https://docs.espressif.com/projects/esp-idf/en/v4.4.1/esp32s3/api-reference/peripherals/gpio.html) · [Fluke continuity guidance](https://www.fluke.com/en-sg/learn/blog/electrical/what-is-continuity)
 
+### Standalone USB camera test
+
+For the 30–40 FPS trial at HVGA (480×320), use the camera board's native USB connector if it exposes the ESP32-S3 USB data pins. The ESP32-S3 provides full-speed USB on GPIO20 (D+) and GPIO19 (D−). The separate CH340 programmer connects to UART0 and has its own test build. At its rated 2 Mbaud with 8N1 framing, it carries at most 195 KiB/s, or about 4.9 KiB per frame at 40 FPS before packet overhead. [Espressif USB device documentation](https://docs.espressif.com/projects/esp-usb/en/latest/esp32s3/usb_device.html) · [WCH CH340 datasheet](https://datasheet.lcsc.com/lcsc/2304140030_WCH-Jiangsu-Qin-Heng-CH340C_C84681.pdf)
+
+```bash
+python3 -m pip install pyserial opencv-python
+pio run -e cam_face_stream_s3_standalone_usb -t upload
+python3 tools/usb_camera_preview.py --list-ports
+python3 tools/usb_camera_preview.py --port /dev/ttyACM0 --resolution hvga
+```
+
+You can upload through the programmer, then move the cable to the camera's verified native USB connector. Select the port that appears after the firmware boots. On Windows use the listed `COM` port. If the CH340 programmer is your only connection, start the UART test at QVGA instead.
+
+```bash
+pio run -e cam_face_stream_s3_standalone_uart -t upload
+python3 tools/usb_camera_preview.py --port /dev/ttyUSB0 --uart --resolution qvga
+```
+
+If the adapter or laptop driver is unreliable at 2 Mbaud, build and upload with `PLATFORMIO_BUILD_FLAGS=-DCAMERA_USB_UART_BAUD=921600` and add `--baud 921600` to the preview command.
+
+Measure reception without preview scaling or JPEG decoding. Repeat with `--resolution qvga` and `--resolution vga` to find the largest profile that sustains your target. Higher `--jpeg-quality` numbers use stronger compression. Compare settings in the same lighting and scene, as exposure and JPEG size affect throughput. Remove `--no-gui` for the resizable live preview.
+
+```bash
+python3 tools/usb_camera_preview.py --port /dev/ttyACM0 --resolution hvga --no-gui --frames 300
+```
+
+The receiver reports verified FPS, byte rate, gaps between frames, and damaged packets. The USB test transfers the sensor's JPEG bytes with a checksum and keeps only the newest frame for display. It uses the Python receiver and runs with Wi-Fi and recognition off.
+
 ### Internet access while streaming
 
 The camera and hub hotspots carry local traffic. Keep a separate internet connection on the laptop, such as Ethernet, and reconnect to the ESP hotspot to renew its DHCP lease after updating the firmware. The laptop tools connect directly to the ESP IP and bypass system HTTP proxies. If the host still prefers the hotspot for DNS, configure that Wi-Fi profile as local-only and use DNS from the internet-connected interface.
