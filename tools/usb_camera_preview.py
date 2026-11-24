@@ -12,7 +12,10 @@ import zlib
 import serial
 from serial.tools import list_ports
 
-from camera_stream import RESOLUTIONS, RESOLUTION_DIMENSIONS
+if __package__:
+    from .camera_stream import RESOLUTIONS, RESOLUTION_DIMENSIONS
+else:
+    from camera_stream import RESOLUTIONS, RESOLUTION_DIMENSIONS
 
 
 MAGIC = b"\xff\xff\x00USBC1"
@@ -108,49 +111,72 @@ class StreamStats:
         )
 
 
-def receive(port, args, stop, latest=None):
-    parser = FrameParser()
-    stats = StreamStats()
-    dimensions = RESOLUTION_DIMENSIONS[RESOLUTIONS[args.resolution]]
-    command = f"\nSTART {args.resolution} {args.jpeg_quality}\n".encode("ascii")
+def open_camera_port(name, *, uart=False, baud=UART_BAUD):
+    port = serial.Serial(baudrate=baud if uart else 115200, timeout=0.05, write_timeout=0.5)
+    # CH340 programmers may wire DTR/RTS to boot/reset.
+    port.dtr = port.rts = not uart
+    port.port = name
+    try:
+        port.open()
+        port.reset_input_buffer()
+    except OSError:
+        port.close()
+        raise
+    return port
+
+
+def iter_serial_frames(port, resolution, quality, stop, timeout, parser):
+    dimensions = RESOLUTION_DIMENSIONS[RESOLUTIONS[resolution]]
+    command = f"\nSTART {resolution} {quality}\n".encode("ascii")
     started = time.monotonic()
     next_command = started
-    sample_at = None
-    sample_frames = 0
-    fps = None
-
+    last_frame_at = None
     try:
         while not stop.is_set():
             now = time.monotonic()
-            last_at = stats.last_at if stats.frames else started
-            if now - last_at >= args.timeout:
+            if now - (last_frame_at if last_frame_at is not None else started) >= timeout:
                 width, height = dimensions
-                raise TimeoutError(f"No {width}×{height} frames for {args.timeout:g}s on {port.port}")
-            if not stats.frames and now >= next_command:
+                raise TimeoutError(f"No {width}×{height} frames for {timeout:g}s on {port.port}")
+            if now >= next_command:
                 port.write(command)
                 next_command = now + 1.0
 
             chunk = port.read(min(port.in_waiting or 1, READ_SIZE))
             for frame in parser.feed(chunk):
-                if frame.dimensions != dimensions:
-                    continue
-                now = time.monotonic()
-                stats.record(frame, now)
-                if latest is not None:
-                    if sample_at is None:
-                        sample_at, sample_frames = now, stats.frames
-                    elif now - sample_at >= 1.0:
-                        fps = (stats.frames - sample_frames) / (now - sample_at)
-                        sample_at, sample_frames = now, stats.frames
-                    latest.append((frame, fps))
-                if args.frames is not None and stats.frames >= args.frames:
-                    return
+                if frame.dimensions == dimensions:
+                    last_frame_at = time.monotonic()
+                    next_command = last_frame_at + 1.0
+                    yield frame
     finally:
-        stats.report(parser.damaged)
         try:
             port.write(b"\nSTOP\n")
         except OSError:
             pass
+
+
+def receive(port, args, stop, latest=None):
+    parser = FrameParser()
+    stats = StreamStats()
+    sample_at = None
+    sample_frames = 0
+    fps = None
+    frames = iter_serial_frames(port, args.resolution, args.jpeg_quality, stop, args.timeout, parser)
+    try:
+        for frame in frames:
+            now = time.monotonic()
+            stats.record(frame, now)
+            if latest is not None:
+                if sample_at is None:
+                    sample_at, sample_frames = now, stats.frames
+                elif now - sample_at >= 1.0:
+                    fps = (stats.frames - sample_frames) / (now - sample_at)
+                    sample_at, sample_frames = now, stats.frames
+                latest.append((frame, fps))
+            if args.frames is not None and stats.frames >= args.frames:
+                return
+    finally:
+        frames.close()
+        stats.report(parser.damaged)
 
 
 def preview(port, args, stop):
@@ -232,13 +258,7 @@ def main():
         args.frames = 300
 
     try:
-        with serial.Serial(baudrate=args.baud if args.uart else 115200,
-                           timeout=0.05, write_timeout=0.5) as port:
-            # Set before opening. CH340 programmers may wire DTR/RTS to boot/reset.
-            port.dtr = port.rts = not args.uart
-            port.port = args.port
-            port.open()
-            port.reset_input_buffer()
+        with open_camera_port(args.port, uart=args.uart, baud=args.baud) as port:
             stop = threading.Event()
             if args.no_gui:
                 receive(port, args, stop)

@@ -1,36 +1,33 @@
 # Smart Home Automation, Vision & Safety System (ESP32 Hub + ESP32-S3 Stream Camera)
 
-A multi-node ESP32 smart home safety and biometric access-control system built with **PlatformIO**. It combines a **Main ESP32 Hub** (`esp32dev`) with one **ESP32-S3 stream camera**. The camera sends MJPEG frames to a laptop for face AI and sends verdicts to the hub over Wi-Fi and **ESP-NOW**.
+A PlatformIO smart home system with an **ESP32 Hub**, an **ESP32-S3 camera**, and a laptop. The camera sends JPEG frames to the laptop through the CH340 programmer. The laptop runs face recognition, serves the browser preview, and sends access events to the hub over Wi-Fi.
 
 ---
 
 ## System Architecture
 
 1. **Main Hub (`[env:esp32dev]`, [`src/main.cpp`](src/main.cpp))**
-   - **Safety Sensors**: Digital Flame IR (`DO` → `GPIO34`), Digital Smoke/Gas MQ-2 (`DO` → `GPIO35`), PIR Motion (`GPIO27`), and HC-SR04 Ultrasonic (`TRIG=GPIO32`, `ECHO=GPIO33`, `<= 25.0 cm`) → sweeping **Siren Buzzer (`GPIO25`)**.
+   - **Safety Sensors**: Digital Flame IR (`DO` → `GPIO34`), analog Smoke/Gas MQ-2 (`AO` → divider → `GPIO35`), PIR Motion (`GPIO27`), and HC-SR04 Ultrasonic (`TRIG=GPIO32`, `ECHO=GPIO33`, `<= 25.0 cm`) → sweeping **Siren Buzzer (`GPIO25`)**.
    - **Per-Sensor Alarm Bypass / Ignore**: Dedicated 1-click toggles and NVS settings allow bypassing/muting the siren trigger for individual sensors (e.g. ignore MQ-2 or Flame sensor alarm) while keeping real-time visual telemetry active and other alarms fully armed.
    - **PIR Scheduled Night Guard**: Restricts the loud siren activation on motion to the overnight window between **Midnight (00:00) and 7:00 AM (07:00)**; movement during the day displays in the UI but remains silent.
    - **Smart Lighting Controller (`GPIO21`)**: 3.3V digital output driving a relay module or MOSFET circuit with dashboard controls, automated event logging, and voice feedback.
    - **HW-104 Spoken Voice Speaker (`GPIO4`)**: PAM8403 2×3W Class-D audio amplifier driven via 312.5 kHz LEDC PWM carrier (4× oversampled) with non-blocking FreeRTOS streaming, providing **100% offline natural human spoken sentences** for completed actions (*"Light turned on/off"*, *"Door unlocked/locked"*, *"Car gate opened/closed"*, *"Access granted, welcome home"*, *"Access denied"*, *"Warning: smoke/flame detected"*, and *"Command confirmed"*), with an NVS toggle between natural speech and musical chimes.
    - **INMP441 I2S Digital Microphone (`GPIO17`, `GPIO16`, `GPIO23`)**: Hardware I2S Master RX sampling at 16 kHz, real-time RMS audio level meter, Voice Activity Detection (VAD), and extensible voice command dispatcher.
    - **MFRC522 RFID Card Access**: Hardware SPI reader (`SS=GPIO5`, `RST=GPIO22`, `SCK=GPIO14`, `MOSI=GPIO13`, `MISO=GPIO12`) opening the dual car gate on authorized UID `52411902`.
-   - **Car Gate Servos (`GPIO18`, `GPIO19`)**: `0° ↔ 160°` smooth non-blocking PWM ramp, opened (`5 seconds`) when an authorized RFID card is presented.
-   - **3rd Face Door Servo (`GPIO26`)**: `0° ↔ 160°` smooth non-blocking PWM ramp, opened exclusively (`3 seconds`) when Camera 1 recognizes an enrolled face.
-   - **Intruder Siren Pulse**: Triggers a **`4-second`** siren burst (`GPIO25` + `GPIO4`) whenever Camera 1 reports an unrecognized face or an unauthorized RFID card is scanned.
-   - **Wireless Hub & Web Admin Panel**: Hosts Wi-Fi SoftAP **`SmartHome-Net`** (password `smarthome123`, channel `1`, IP `http://192.168.4.1`) + optional Home Wi-Fi STA uplink, ESP-NOW receiver, and a **Full Web Admin Dashboard**:
+   - **Car Gate Servos (`GPIO18`, `GPIO19`)** travel to 160° on an authorized RFID scan and hold for 8 seconds by default once both reach their commanded open angle.
+   - **Face Door Servo (`GPIO26`)** travels to 160° on recognition and holds for 3 seconds by default once it reaches its commanded open angle.
+   - **Intruder Siren Pulse** starts a 4-second alarm by default when the laptop confirms an unknown face or the hub receives an unauthorized RFID scan.
+   - **Wireless Hub & Web Admin Panel** serves `http://192.168.4.1` on **`SmartHome-Net`** (password `smarthome123`) and optionally on your home Wi-Fi.
      - **Live System Clock & Time Sync**: Displays live clock (default boot time: 12:00 PM), 1-click Browser Time Sync, and manual time setter.
      - **Smart Lighting Switch**: Interactive ON/OFF/Toggle dashboard buttons with live state feedback on `GPIO21`.
      - **Voice Assistant & VU Meter**: Real-time microphone VU level bar, speech activity indicator badge, speaker status, and instant voice verification test triggers.
-     - **Live Camera Streams**: Embedded face-camera viewport with live FPS/latency and direct/proxy streaming with live FPS/latency and direct/proxy streaming.
-     - **Sensors & Telemetry**: Dynamic visual gauges and alert badges for Flame (`AO`), Smoke (`MQ-2`), Motion (`PIR`), and Ultrasonic (`HC-SR04`).
+     - **Live Camera Stream** loads the laptop's video directly in the browser.
+     - **Sensors & Telemetry** displays flame, MQ-2 analog voltage, PIR motion, and ultrasonic distance.
      - **Manual Overrides**: Quick-action controls for Car Gate (open/close), Face Door (unlock/lock), Smart Light (toggle), and Siren Alarm (mute/test).
      - **NVS Settings & Event Log**: Save custom thresholds, PIR schedule hours, timers, and Home Wi-Fi credentials to Flash, and view the live rolling system event log.
 
-2. **Face Camera — ESP32-S3 stream with laptop AI** (`[env:cam_face_stream_s3]`, `src/cam_face_stream/main.cpp`)
-   - Captures JPEG frames on the ESP32-S3 and serves a low-latency MJPEG stream on port 81.
-   - Face detection and recognition run on the laptop. Recognition verdicts return to the camera and Main Hub over HTTP and ESP-NOW.
-   - A recognized face unlocks Door Servo 3. An unknown face starts the intruder siren.
-   - Two PSRAM frame buffers with latest-frame capture, Wi-Fi power-save disabled, and high transmit power support live JPEG streaming.
+2. **Face Camera** (`[env:cam_face_stream_s3_standalone_uart]`, `src/cam_usb_stream/main.cpp`) captures sensor JPEGs into PSRAM and sends them to the laptop over the CH340 connection.
+3. **Laptop Face Bridge** reads UART once, serves the newest JPEG to the dashboard, runs recognition, and sends verdicts to the main hub. The dashboard, RFID, manual controls, and sensors remain available when the laptop or camera goes offline.
 
 ---
 
@@ -38,10 +35,10 @@ A multi-node ESP32 smart home safety and biometric access-control system built w
 
 - **1× ESP32 DevKit** (`esp32dev`) — Main Hub
 - **1× ESP32-S3 camera board** with OV2640-compatible camera and PSRAM
-- **USB-to-TTL (`FTDI` / `CP2102` / `CH340`) Programmer** (3.3 V UART TX/RX, for flashing ESP32-S3 camera board; or an ESP32-CAM-MB daughterboard)
+- **CH340 USB-to-UART programmer** for camera flashing and live streaming, with 3.3 V logic on TX/RX.
 - **Sensors & Actuators on Main Hub**:
   - Digital IR Flame Sensor (`DO` → `GPIO34`)
-  - Digital MQ-2 Smoke / Gas Sensor (`DO` → `GPIO35`)
+  - Analog MQ-2 Smoke / Gas Sensor (`AO` → divider → `GPIO35`)
   - PIR Motion Sensor (`OUT` → `GPIO27`)
   - HC-SR04 Ultrasonic Sensor (`TRIG` → `GPIO32`, `ECHO` → `GPIO33` via 5 V → 3.3 V resistor divider)
   - Passive Piezo Buzzer (`SIG` → `GPIO25`)
@@ -60,17 +57,23 @@ A multi-node ESP32 smart home safety and biometric access-control system built w
 | **HW-104 Spoken Voice Speaker** | `L / R` (Audio In) | `GPIO4` | LEDC 312.5 kHz PWM (8-bit, Timer 3 Ch 6) | PAM8403 2×3W Class-D amplifier; non-blocking FreeRTOS natural spoken sentences & dual siren alarms |
 | **INMP441 I2S Microphone** | `SCK` (BCLK)<br>`WS` (LRCLK)<br>`SD` (Data)<br>`L/R` (Channel)<br>`VDD` | `GPIO17`<br>`GPIO16`<br>`GPIO23`<br>`GND`<br>`3V3` | Hardware I2S (`I2S_NUM_0`) | 16 kHz Master RX digital microphone; VDD connects strictly to 3.3V (NOT 5V) |
 | **Flame Sensor** | `DO` | `GPIO34` | Digital Input (`INPUT`) | Active-LOW (0V = Flame, 3.3V = Safe); potentiometer calibrated on module; siren trigger can be ignored via dashboard |
-| **MQ-2 Smoke Sensor** | `DO` | `GPIO35` | Digital Input (`INPUT`) | Active-LOW (0V = Smoke/Gas, 3.3V = Clean); potentiometer calibrated on module; siren trigger can be ignored via dashboard |
+| **MQ-2 Smoke Sensor** | `AO` | `GPIO35` | ADC1, 11 dB attenuation | Divide the module output before connecting it to GPIO35. Set the alarm threshold in mV in the dashboard. |
 | **PIR Motion Sensor** | `OUT` | `GPIO27` | `INPUT_PULLDOWN` | Active `HIGH` (`3.3 V` logic); siren only activates during night window (**Midnight–7 AM**) |
 | **Ultrasonic Sensor** | `TRIG` | `GPIO32` | Digital Output | 10 µs trigger pulse every `60 ms` (`<= 25.0 cm` triggers siren) |
 | **Ultrasonic Sensor** | `ECHO` | `GPIO33` | Digital Input | **Use 5 V → 3.3 V voltage divider** |
 | **Buzzer** | `SIG` / `+` | `GPIO25` | LEDC Tone PWM (8-bit, Timer 2 Ch 4) | `700 Hz ↔ 1800 Hz` alarm siren |
-| **Car Gate Servo 1** | `PWM` | `GPIO18` | `ESP32Servo` 50 Hz (16-bit, Timer 0) | Opens `0° → 160°` (`5 s`) on valid RFID UID `52411902` |
-| **Car Gate Servo 2** | `PWM` | `GPIO19` | `ESP32Servo` 50 Hz (16-bit, Timer 0) | Opens `0° → 160°` (`5 s`) on valid RFID UID `52411902` |
+| **Car Gate Servo 1** | `PWM` | `GPIO18` | `ESP32Servo` 50 Hz (16-bit, Timer 0) | Opens `0° → 160°` on valid RFID UID `52411902` |
+| **Car Gate Servo 2** | `PWM` | `GPIO19` | `ESP32Servo` 50 Hz (16-bit, Timer 0) | Opens `0° → 160°` on valid RFID UID `52411902` |
 | **Face Door Servo 3** | `PWM` | `GPIO26` | `ESP32Servo` 50 Hz (16-bit, Timer 0) | Opens `0° → 160°` (`3 s`) on recognized face from Camera 1 |
 | **MFRC522 RFID Reader** | `SDA` / `SS`<br>`SCK`<br>`MOSI`<br>`MISO`<br>`RST` | `GPIO5`<br>`GPIO14`<br>`GPIO13`<br>`GPIO12`<br>`GPIO22` | Hardware SPI (`MFRC522`) | Reads 13.56 MHz RFID tags; accepted UID: `52411902` |
 
-### ESP32-S3 camera power and flash
+For the **face door servo**, move its signal wire to main ESP32 **GPIO26**. Connect servo power to a supply rated for the motors' voltage and stall current. Connect the servo supply ground to the main ESP32 ground.
+
+For a **5 V MQ-2 module**, connect module `VCC` to the rated 5 V supply and share its ground with the hub. Wire `AO` through **12 kΩ** to the GPIO35 junction, and **10 kΩ** from that junction to ground. A 5 V output becomes about 2.27 V at GPIO35. Leave `DO` disconnected. After sensor warm-up, use the dashboard reading to set a site-specific threshold above the clean-air baseline. The initial **1200 mV** setting is measured at GPIO35. The project reports voltage and has no gas concentration calibration. [Winsen MQ-2 datasheet](https://www.winsen-sensor.com/d/files/MQ-2.pdf) · [Espressif ADC documentation](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/adc.html)
+
+### ESP32-S3 camera to laptop via CH340
+
+Leave the camera on the CH340 programmer after uploading the UART build. For a separate, wired 3.3 V logic adapter, connect adapter `TX` to camera `U0RXD` (GPIO44), adapter `RX` to `U0TXD` (GPIO43), and ground to ground. Use the camera board's rated power input. The camera has no servo or signal wires to the hub. [Espressif ESP32-S3 UART pin documentation](https://docs.espressif.com/projects/esp-hardware-design-guidelines/en/latest/esp32s3/schematic-checklist.html#uart)
 
 The camera targets are configured for the **ESP32-S3-CAM N16R8** with 16 MB of quad flash at 80 MHz and 8 MB of octal PSRAM. The app and settings keep the existing partition layout. Use the CH340 USB-to-UART programmer for the board sold with that adapter. [Espressif memory settings](https://docs.espressif.com/projects/arduino-esp32/en/latest/troubleshooting.html)
 
@@ -93,24 +96,47 @@ pio run
 # 1) Flash Main ESP32 Hub (esp32dev)
 pio run -e esp32dev -t upload
 
-# 2) Flash ESP32-S3 face camera for use with the hub
-pio run -e cam_face_stream_s3 -t upload
+# 2) Flash ESP32-S3 camera for UART streaming
+pio run -e cam_face_stream_s3_standalone_uart -t upload
 
 ```
 
-Monitor any board at **`115200` baud**:
+Monitor the hub at **`115200` baud**. Close the camera serial monitor before running the bridge.
 ```bash
 pio device monitor -b 115200
 ```
 
 ---
 
-## Camera streaming and laptop recognition
+## Run the integrated UART system on Windows
+
+In the PlatformIO terminal, use the COM ports from Device Manager. In this example the hub is `COM4` and the camera's CH340 is `COM5`.
+
+```powershell
+pio run -e esp32dev -t upload --upload-port COM4
+pio run -e cam_face_stream_s3_standalone_uart -t upload --upload-port COM5
+
+py -3.11 -m venv "$env:LOCALAPPDATA\smarthome-face-venv"
+$facePython = "$env:LOCALAPPDATA\smarthome-face-venv\Scripts\python.exe"
+& $facePython -m pip install -r face_recigntion2\requirements.txt pyserial "setuptools<81"
+```
+
+If `dlib` needs to compile on your machine, install the C++ prerequisites listed in the [Windows face recognition setup](face_recigntion2/docs/03-implementation/setup.md).
+
+Connect Windows to **SmartHome-Net** and open **http://192.168.4.1**. Close any USB preview window that owns the camera COM port. Start the laptop bridge with the profile you tested.
+
+```powershell
+& $facePython tools\laptop_face_bridge.py --uart-port COM5 --resolution qvga --jpeg-quality 16
+```
+
+Press **E** in the preview to enroll a face. Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop. If the laptop preview works but the dashboard reports **PREVIEW UNREACHABLE**, allow inbound TCP **8080** for the bridge from the trusted local network in Windows Firewall. If port 8080 is in use, pass `--preview-port` with an available port.
+
+### Wi-Fi camera bench mode
 
 | Mode | Camera firmware | Wi-Fi | Direct MJPEG preview |
 | --- | --- | --- | --- |
 | Standalone | `cam_face_stream_s3_standalone` | `SmartHome-FaceCam` | `http://192.168.11.1:81/stream` |
-| With hub | `cam_face_stream_s3` | `SmartHome-Net` | `http://192.168.4.101:81/stream` |
+| Legacy Wi-Fi streaming | `cam_face_stream_s3` | `SmartHome-Net` | `http://192.168.4.101:81/stream` |
 
 Both Wi-Fi networks use `smarthome123`. The camera's port 80 root redirects to the raw stream. Its control and recognition API stays on port 80. The hub dashboard remains at `http://192.168.4.1`. The integrated camera starts its fallback hotspot if it cannot join the hub after about 12 seconds.
 
