@@ -1,6 +1,7 @@
 """Exercise the laptop UART bridge with a fake camera and a loopback hub."""
 
 from collections import deque
+import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
@@ -16,7 +17,7 @@ import numpy as np
 
 from tools.camera_stream import iter_jpegs
 from tools.laptop_face_bridge import LaptopFaceBridge
-from tools.laptop_hub import LaptopHubClient
+from tools.laptop_hub import DEFAULT_PREVIEW_PORT, LaptopHubClient, make_preview_server
 from tools.serial_camera import HEADER, MAGIC, SerialCamera
 
 
@@ -36,6 +37,13 @@ class TestUartBridge(unittest.TestCase):
         self.assertIn("COM5 (2000000 baud)", labels)
         self.assertIn("320x240 source   |   Preview 30.0 FPS   |   AI 12 ms", labels)
 
+    def test_explicit_preview_port_reports_permission_error(self):
+        error = PermissionError(errno.EACCES, "Access denied")
+        with patch("tools.laptop_hub.ThreadingHTTPServer", side_effect=error) as listen:
+            with self.assertRaisesRegex(OSError, r"127\.0\.0\.1:8081.*Omit --preview-port"):
+                make_preview_server("127.0.0.1", 8081, lambda: (None, 0))
+        listen.assert_called_once()
+
     def test_direct_preview_and_feedback_recover_independently(self):
         _, image = cv2.imencode(".jpg", np.zeros((240, 320, 3), dtype=np.uint8))
         jpeg = image.tobytes()
@@ -44,6 +52,7 @@ class TestUartBridge(unittest.TestCase):
         posts = deque()
         observations = deque()
         serial_commands = deque()
+        preview_port_attempts = []
 
         class Camera:
             port = "TEST"
@@ -110,17 +119,29 @@ class TestUartBridge(unittest.TestCase):
                        and args["event"] == [event] and args["online"] == [online]
                        for path, args in tuple(posts))
 
+        def bind_preview(address, handler):
+            preview_port_attempts.append(address[1])
+            if address[1] == DEFAULT_PREVIEW_PORT:
+                error = OSError("Access denied")
+                error.winerror = 10013
+                raise error
+            return ThreadingHTTPServer(address, handler)
+
         with ThreadingHTTPServer(("127.0.0.1", 0), Hub) as hub:
             engine = Engine()
             client = SerialCamera("TEST", 2_000_000, "qvga", 16)
-            publisher = LaptopHubClient(f"127.0.0.1:{hub.server_port}", "127.0.0.1", 0)
+            publisher = LaptopHubClient(f"127.0.0.1:{hub.server_port}", "127.0.0.1", None)
             bridge = LaptopFaceBridge(client, engine, publisher, show_gui=False)
             hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
             bridge_thread = threading.Thread(target=bridge.run, daemon=True)
-            with patch("tools.serial_camera.open_camera_port", return_value=Camera()):
+            with (
+                patch("tools.serial_camera.open_camera_port", return_value=Camera()),
+                patch("tools.laptop_hub.ThreadingHTTPServer", side_effect=bind_preview),
+            ):
                 bridge_thread.start()
                 try:
                     wait_for(lambda: bridge._stream_state()[0])
+                    self.assertEqual(preview_port_attempts, [DEFAULT_PREVIEW_PORT, 0])
                     base = f"http://127.0.0.1:{publisher.preview_port}"
                     # The laptop serves video while the hub is still offline.
                     with urllib.request.urlopen(base + "/stream", timeout=2) as response:

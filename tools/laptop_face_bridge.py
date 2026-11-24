@@ -15,11 +15,11 @@ import numpy as np
 
 if __package__:
     from .camera_stream import RESOLUTIONS
-    from .laptop_hub import FRAME_MAX_AGE, LaptopHubClient, make_preview_server
+    from .laptop_hub import DEFAULT_PREVIEW_PORT, FRAME_MAX_AGE, LaptopHubClient, make_preview_server
     from .serial_camera import SerialCamera, UART_BAUD, add_light_argument, validate_light
 else:
     from camera_stream import RESOLUTIONS
-    from laptop_hub import FRAME_MAX_AGE, LaptopHubClient, make_preview_server
+    from laptop_hub import DEFAULT_PREVIEW_PORT, FRAME_MAX_AGE, LaptopHubClient, make_preview_server
     from serial_camera import SerialCamera, UART_BAUD, add_light_argument, validate_light
 
 
@@ -348,7 +348,6 @@ class LaptopFaceBridge:
         print(f" [SMART HOME] Laptop Face Recognition AI Online")
         print(f" - Camera Stream: {self.client.description}")
         print(f" - Feedback API: {self.hub.feedback_url}")
-        print(f" - Dashboard preview port: {self.hub.preview_port}")
         print(f" - Enrolled Faces: {len(self.engine.known_names)} loaded from {self.engine.faces_dir}")
         print(f" - Hotkeys: Press 'e' in preview window to enroll, 'q' to quit")
         print("=" * 70 + "\n")
@@ -391,6 +390,7 @@ class LaptopFaceBridge:
             preview_server = make_preview_server(self.hub.preview_bind, self.hub.preview_port,
                                                  self._preview_frame)
             self.hub.preview_port = preview_server.server_port
+            print(f"[LAPTOP-HUB] Dashboard preview listening on TCP port {self.hub.preview_port}.", flush=True)
             preview_worker = threading.Thread(target=preview_server.serve_forever, daemon=True)
             workers.append(preview_worker)
             workers.append(threading.Thread(target=self.hub.run_feedback,
@@ -481,7 +481,8 @@ def main():
     parser.add_argument("--baud", type=int, default=UART_BAUD, help="Camera UART baud rate")
     parser.add_argument("--hub", default="192.168.4.1", help="Hub address for dashboard preview and feedback")
     parser.add_argument("--preview-bind", default="0.0.0.0", help="Laptop interface for the dashboard preview")
-    parser.add_argument("--preview-port", type=int, default=8080, help="Laptop HTTP port for the dashboard preview")
+    parser.add_argument("--preview-port", type=int,
+                        help=f"Fixed dashboard preview port (default: {DEFAULT_PREVIEW_PORT} or an available port)")
     parser.add_argument("--resolution", choices=RESOLUTIONS, default="qvga", help="Set the camera resolution before streaming")
     parser.add_argument("--jpeg-quality", type=int, default=16,
                         help="Set JPEG compression. Higher numbers send smaller frames")
@@ -495,8 +496,10 @@ def main():
     validate_light(parser, args.light)
     if not 10 <= args.jpeg_quality <= 63:
         parser.error("--jpeg-quality must be between 10 and 63")
-    if not 1 <= args.preview_port <= 65535 or args.baud <= 0:
-        parser.error("--preview-port must be 1–65535 and --baud must be positive")
+    if args.preview_port is not None and not 1 <= args.preview_port <= 65535:
+        parser.error("--preview-port must be 1–65535")
+    if args.baud <= 0:
+        parser.error("--baud must be positive")
     client = SerialCamera(args.uart_port, args.baud, args.resolution, args.jpeg_quality, args.light)
     hub = LaptopHubClient(args.hub, args.preview_bind, args.preview_port)
     engine = FastFaceEngine(args.faces_dir, distance_thresh=args.thresh)

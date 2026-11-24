@@ -133,7 +133,9 @@ Connect Windows to **SmartHome-Net** and open **http://192.168.4.1**. Close any 
 & $facePython tools\laptop_face_bridge.py --uart-port COM5 --resolution qvga --jpeg-quality 16
 ```
 
-Press **E** in the preview to enroll a face. Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop. If the laptop preview works but the dashboard reports **PREVIEW UNREACHABLE**, allow inbound TCP **8080** for the bridge from the trusted local network in Windows Firewall. If port 8080 is in use, pass `--preview-port` with an available port.
+Press **E** in the preview to enroll a face. Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop.
+
+The bridge tries TCP port **8080** and uses an available port if Windows rejects that bind with WinError 10013 or the port is already in use. The bridge prints the actual listening port and reports it to the dashboard. Use `--preview-port` to request a fixed port. If the laptop preview works but the dashboard reports **PREVIEW UNREACHABLE**, allow inbound access to the reported port from the trusted local network in Windows Firewall. [Windows socket error reference](https://learn.microsoft.com/en-us/windows/win32/winsock/windows-sockets-error-codes-2)
 
 To adjust brightness, add `--light GPIO LEVEL` with the GPIO from the uploaded profile. Use level 0 to keep the light off. The level range is 0–255.
 

@@ -1,5 +1,6 @@
 """Laptop HTTP preview and Wi-Fi hub feedback for the face bridge."""
 
+import errno
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
@@ -10,6 +11,7 @@ import urllib.parse
 import urllib.request
 
 FRAME_MAX_AGE = 1.5
+DEFAULT_PREVIEW_PORT = 8080
 UNKNOWN_CONFIRMATIONS = 3
 EVENT_COOLDOWN = {"recognized": 2.5, "unknown": 4.0}
 
@@ -147,4 +149,23 @@ def make_preview_server(bind, port, latest_frame):
             finally:
                 viewers.release()
 
-    return ThreadingHTTPServer((bind, port), PreviewHandler)
+    preferred_port = DEFAULT_PREVIEW_PORT if port is None else port
+    try:
+        return ThreadingHTTPServer((bind, preferred_port), PreviewHandler)
+    except OSError as exc:
+        # Winsock can deny a reserved or exclusively bound port with WSAEACCES.
+        port_unavailable = (exc.errno in (errno.EACCES, errno.EADDRINUSE, 10013, 10048)
+                            or getattr(exc, "winerror", None) in (10013, 10048))
+        if not port_unavailable:
+            raise
+        if port is not None:
+            raise OSError(f"Cannot open dashboard preview on {bind}:{port} ({exc}). "
+                          "Omit --preview-port to select a port automatically.") from exc
+
+    try:
+        server = ThreadingHTTPServer((bind, 0), PreviewHandler)
+    except OSError as exc:
+        raise OSError(f"Dashboard preview port {preferred_port} is unavailable and a free port "
+                      f"could not be opened on {bind} ({exc}).") from exc
+    print(f"[LAPTOP-HUB] Port {preferred_port} unavailable. Using TCP port {server.server_port}.", flush=True)
+    return server
