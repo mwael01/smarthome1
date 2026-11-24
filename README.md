@@ -135,6 +135,8 @@ Connect Windows to **SmartHome-Net** and open **http://192.168.4.1**. Close any 
 
 Press **E** in the preview to enroll a face. Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop.
 
+The laptop preview shows **RX FPS** for valid frames arriving over serial, **Preview FPS** for frames drawn in the window, and **AI FPS** for completed recognition passes. The model runs in a separate process and takes the newest frame when ready. The preview and dashboard keep using new frames while the model works. If RX FPS is low, close the bridge and measure the serial feed on its own with `& $facePython tools\usb_camera_preview.py --port COM5 --uart --resolution qvga --no-gui --frames 300`.
+
 The bridge tries TCP port **8080** and uses an available port if Windows rejects that bind with WinError 10013 or the port is already in use. The bridge prints the actual listening port and reports it to the dashboard. Use `--preview-port` to request a fixed port. If the laptop preview works but the dashboard reports **PREVIEW UNREACHABLE**, allow inbound access to the reported port from the trusted local network in Windows Firewall. [Windows socket error reference](https://learn.microsoft.com/en-us/windows/win32/winsock/windows-sockets-error-codes-2)
 
 To adjust brightness, add `--light GPIO LEVEL` with the GPIO from the uploaded profile. Use level 0 to keep the light off. The level range is 0–255.

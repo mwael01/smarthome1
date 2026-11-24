@@ -2,15 +2,16 @@
 """Recognize faces from the serial camera and send verdicts to the Wi-Fi hub."""
 
 import argparse
+from dataclasses import dataclass
+import multiprocessing
 import os
+import signal
 import sys
 import threading
 import time
 from typing import List, Optional, Tuple
 
 import cv2
-import dlib
-import face_recognition
 import numpy as np
 
 if __package__:
@@ -23,10 +24,21 @@ else:
     from serial_camera import SerialCamera, UART_BAUD, add_light_argument, validate_light
 
 
+OVERLAY_MAX_AGE = 0.4
+
+
+def decode_jpeg(jpeg):
+    return cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
 class FastFaceEngine:
     """High-speed multi-scale face detector and ResNet embedding matcher."""
 
     def __init__(self, faces_dir: str, distance_thresh: float = 0.58):
+        import dlib
+        import face_recognition
+
+        self._faces = face_recognition
         self.faces_dir = os.path.abspath(faces_dir)
         self.distance_thresh = distance_thresh
         os.makedirs(self.faces_dir, exist_ok=True)
@@ -47,8 +59,8 @@ class FastFaceEngine:
                 if fname.lower().endswith((".jpg", ".jpeg", ".png")):
                     path = os.path.join(self.faces_dir, fname)
                     try:
-                        img = face_recognition.load_image_file(path)
-                        encs = face_recognition.face_encodings(img)
+                        img = self._faces.load_image_file(path)
+                        encs = self._faces.face_encodings(img)
                         if encs:
                             self.known_encodings.append(encs[0])
                             name = os.path.splitext(fname)[0].replace("_", " ")
@@ -63,7 +75,7 @@ class FastFaceEngine:
         left, top, right, bottom = box
         rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
         dlib_box = (top, right, bottom, left)
-        encs = face_recognition.face_encodings(rgb, [dlib_box])
+        encs = self._faces.face_encodings(rgb, [dlib_box])
         if not encs:
             return False
 
@@ -103,7 +115,7 @@ class FastFaceEngine:
 
         # Multi-scale face detection:
         # 1. Primary: face_recognition HOG with upsample=1
-        boxes = face_recognition.face_locations(rgb, number_of_times_to_upsample=1, model="hog")
+        boxes = self._faces.face_locations(rgb, number_of_times_to_upsample=1, model="hog")
 
         # 2. Secondary fallback: dlib frontal face detector
         if not boxes:
@@ -135,7 +147,7 @@ class FastFaceEngine:
         box = [int(left), int(top), int(right), int(bottom)]
 
         # Extract 128-d face embedding vector
-        encs = face_recognition.face_encodings(rgb, [(top, right, bottom, left)])
+        encs = self._faces.face_encodings(rgb, [(top, right, bottom, left)])
         if not encs:
             return {
                 "result": "aligning",
@@ -162,7 +174,7 @@ class FastFaceEngine:
                     "unregistered": True,
                 }
 
-            dists = face_recognition.face_distance(self.known_encodings, encs[0])
+            dists = self._faces.face_distance(self.known_encodings, encs[0])
             best_idx = int(np.argmin(dists))
             best_dist = float(dists[best_idx])
             sim = max(0.0, min(1.0, 1.0 - (best_dist / self.distance_thresh) * 0.5))
@@ -190,22 +202,104 @@ class FastFaceEngine:
                     "matchId": -1,
                 }
 
+    def analyze_jpeg(self, jpeg):
+        image = decode_jpeg(jpeg)
+        return self.analyze_frame(image) if image is not None else None
+
+    def enroll_jpeg(self, jpeg, box, name):
+        image = decode_jpeg(jpeg)
+        return image is not None and self.enroll(image, box, name)
+
+
+def run_face_worker(connection, faces_dir, threshold):
+    # The preview process handles Ctrl+C and closes the pipe on exit.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    with connection:
+        try:
+            engine = FastFaceEngine(faces_dir, distance_thresh=threshold)
+        except Exception as exc:
+            print(f"[FACE-ENGINE] Cannot load recognition model: {exc}", file=sys.stderr)
+            return
+        while True:
+            try:
+                method, args = connection.recv()
+            except (EOFError, OSError):
+                return
+            try:
+                response = True, getattr(engine, method)(*args)
+            except Exception as exc:
+                response = False, str(exc)
+            try:
+                connection.send(response)
+            except (EOFError, OSError):
+                return
+
+
+class FaceWorker:
+    """Run dlib outside the preview process so its calls cannot hold the preview's GIL."""
+
+    def __init__(self, faces_dir, threshold):
+        self.faces_dir = os.path.abspath(faces_dir)
+        context = multiprocessing.get_context("spawn")
+        self._connection, child = context.Pipe()
+        self._process = context.Process(target=run_face_worker,
+                                        args=(child, self.faces_dir, threshold), daemon=True)
+        try:
+            self._process.start()
+        except BaseException:
+            self._connection.close()
+            raise
+        finally:
+            child.close()
+
+    def _request(self, method, *args):
+        self._connection.send((method, args))
+        ok, response = self._connection.recv()
+        if not ok:
+            raise RuntimeError(response)
+        return response
+
+    def analyze_jpeg(self, jpeg):
+        return self._request("analyze_jpeg", jpeg)
+
+    def enroll_jpeg(self, jpeg, box, name):
+        return self._request("enroll_jpeg", jpeg, box, name)
+
+    def load_known_faces(self):
+        self._request("load_known_faces")
+
+    def close(self):
+        self._connection.close()
+        self._process.join(timeout=0.25)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1.0)
+
+
+@dataclass(frozen=True)
+class FaceDetection:
+    jpeg: bytes
+    frame_at: float
+    verdict: dict
+
 
 class LaptopFaceBridge:
     """Keep the newest serial frame available to the detector and dashboard."""
 
-    def __init__(self, client, engine: FastFaceEngine, hub, show_gui: bool = True):
+    def __init__(self, client, engine, hub, show_gui: bool = True):
         self.client = client
         self.engine = engine
         self.hub = hub
         self.show_gui = show_gui
-        self.fps = 0.0
         self.frames_count = 0
+        self._analyzed_count = 0
 
         self._stop = threading.Event()
         self._latest_jpg: Optional[bytes] = None
         self._latest_frame_at = 0.0
         self._stream_generation = 0
+        self._detection = None
+        self._analysis_action = None
         self._jpg_lock = threading.Condition()
 
     def stop(self):
@@ -231,12 +325,6 @@ class LaptopFaceBridge:
         with self._jpg_lock:
             return self._recent_frame(), self._stream_generation
 
-    def _observe_result(self, verdict, frame_at, generation):
-        with self._jpg_lock:
-            if self._stream_generation != generation or not self._recent_frame():
-                return
-            self.hub.observe(verdict, frame_at)
-
     def _stream_reader_loop(self):
         while not self._stop.is_set():
             retry_delay = 1.0
@@ -257,12 +345,71 @@ class LaptopFaceBridge:
                 with self._jpg_lock:
                     self._latest_jpg = None
                     self._stream_generation += 1
+                    self._detection = None
                     self.hub.observe({}, time.monotonic())
                     self._jpg_lock.notify_all()
             self._stop.wait(retry_delay)
 
+    def _analysis_loop(self):
+        analyzed_frame = 0
+        failed = False
+        while not self._stop.is_set():
+            with self._jpg_lock:
+                self._jpg_lock.wait_for(lambda: (
+                    self._stop.is_set() or self._analysis_action is not None
+                    or (self._latest_jpg is not None and self.frames_count != analyzed_frame)
+                ))
+                if self._stop.is_set():
+                    return
+                action = self._analysis_action
+                self._analysis_action = None
+                if action is None:
+                    analyzed_frame = self.frames_count
+                    if not self._recent_frame():
+                        continue
+                    jpeg = self._latest_jpg
+                    frame_at = self._latest_frame_at
+                    generation = self._stream_generation
+            try:
+                if action == ("reload",):
+                    self.engine.load_known_faces()
+                elif action is not None:
+                    if not self.engine.enroll_jpeg(*action[1:]):
+                        print("[ENROLL] Could not save a face from that frame.", flush=True)
+                else:
+                    verdict = self.engine.analyze_jpeg(jpeg)
+                    if verdict is not None:
+                        with self._jpg_lock:
+                            self._analyzed_count += 1
+                            if (self._stream_generation == generation and self._recent_frame()
+                                    and time.monotonic() - frame_at <= FRAME_MAX_AGE):
+                                self._detection = FaceDetection(jpeg, frame_at, verdict)
+                                self.hub.observe(verdict, frame_at)
+                failed = False
+            except (EOFError, OSError, RuntimeError) as exc:
+                if not failed and not self._stop.is_set():
+                    print(f"[FACE-ENGINE] Recognition unavailable: {exc}", file=sys.stderr)
+                failed = True
+                self._stop.wait(0.25)
+
+    def _queue_analysis_action(self, action):
+        with self._jpg_lock:
+            if self._analysis_action is None and not self._stop.is_set():
+                self._analysis_action = action
+                self._jpg_lock.notify_all()
+
+    def _prompt_enrollment(self, detection):
+        if sys.stdin is None or not sys.stdin.isatty():
+            print("[ENROLL] Open the bridge in an interactive terminal to enter a name.", flush=True)
+            return
+        try:
+            name = input("\n[ENROLL] Enter name for face in view: ").strip()
+        except (EOFError, OSError):
+            return
+        self._queue_analysis_action(("enroll", detection.jpeg, detection.verdict["box"], name))
+
     def draw_hud(self, bgr_img: Optional[np.ndarray], verdict: dict, fps: float,
-                 size: Tuple[int, int] = (960, 720)) -> np.ndarray:
+                 size: Tuple[int, int] = (960, 720), *, rx_fps=0.0, ai_fps=0.0) -> np.ndarray:
         width, height = size
         canvas = np.empty((height, width, 3), dtype=np.uint8)
         cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), (24, 21, 18), cv2.FILLED)
@@ -334,8 +481,8 @@ class LaptopFaceBridge:
         if footer >= 25 and width >= 100:
             cv2.line(canvas, (0, height - footer), (width - 1, height - footer), (55, 48, 40))
             if live:
-                stats = (f"{source_w}x{source_h} source   |   Preview {fps:.1f} FPS"
-                         f"   |   AI {verdict.get('inferenceMs', 0)} ms")
+                stats = (f"{source_w}x{source_h}  |  RX {rx_fps:.1f} FPS"
+                         f"  |  Preview {fps:.1f} FPS  |  AI {ai_fps:.1f} FPS")
             else:
                 stats = self.client.description
             write(stats, 18, height - footer + 23, 0.52, text, width - 36)
@@ -343,46 +490,87 @@ class LaptopFaceBridge:
                 write("E  Enroll     R  Reload faces     Q  Quit", 18, height - 15, 0.46, muted, width - 36)
         return canvas
 
+    def _preview_loop(self):
+        window = "Smart Home Face Recognition - Camera 1"
+        size = (960, 720)
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+        cv2.resizeWindow(window, *size)
+        cv2.imshow(window, self.draw_hud(None, {}, 0.0, size))
+
+        decoded_frame = last_rx = last_ai = presented = 0
+        sample_at = time.monotonic()
+        rx_fps = preview_fps = ai_fps = 0.0
+        image = painted_image = painted_detection = None
+        painted_size = size
+        enrollment_prompt = None
+
+        while not self._stop.is_set():
+            with self._jpg_lock:
+                jpeg = self._latest_jpg if self._recent_frame() else None
+                rx_count = self.frames_count
+                ai_count = self._analyzed_count
+                detection = self._detection
+            now = time.monotonic()
+            if jpeg is None:
+                image = None
+            elif rx_count != decoded_frame:
+                decoded_frame = rx_count
+                image = decode_jpeg(jpeg)
+
+            if image is None or (detection is not None and now - detection.frame_at > OVERLAY_MAX_AGE):
+                detection = None
+            verdict = detection.verdict if detection is not None else {}
+            try:
+                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) == 0:
+                    return
+                _, _, width, height = cv2.getWindowImageRect(window)
+                if width > 0 and height > 0:
+                    size = width, height
+            except cv2.error:
+                pass  # Some HighGUI backends do not expose the drawable size.
+
+            elapsed = now - sample_at
+            rates_updated = elapsed >= 1.0
+            if rates_updated:
+                rx_fps = (rx_count - last_rx) / elapsed
+                preview_fps = presented / elapsed
+                ai_fps = (ai_count - last_ai) / elapsed
+                sample_at, last_rx, last_ai, presented = now, rx_count, ai_count, 0
+
+            new_video = image is not None and image is not painted_image
+            if (image is not painted_image or detection is not painted_detection or size != painted_size
+                    or (image is not None and rates_updated)):
+                cv2.imshow(window, self.draw_hud(image, verdict, preview_fps, size,
+                                                rx_fps=rx_fps, ai_fps=ai_fps))
+                painted_image, painted_detection, painted_size = image, detection, size
+                presented += int(new_video)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q'), ord('Q')):
+                return
+            if key in (ord('e'), ord('E')):
+                if detection is None or not verdict.get("faceDetected"):
+                    print("[ENROLL] Look into the camera so a face can be detected.")
+                elif enrollment_prompt is None or not enrollment_prompt.is_alive():
+                    enrollment_prompt = threading.Thread(target=self._prompt_enrollment,
+                                                         args=(detection,), daemon=True)
+                    enrollment_prompt.start()
+            elif key in (ord('r'), ord('R')):
+                self._queue_analysis_action(("reload",))
+
+            if not new_video:
+                self._stop.wait(0.005)
+
     def run(self):
         print("\n" + "=" * 70)
-        print(f" [SMART HOME] Laptop Face Recognition AI Online")
+        print(" [SMART HOME] Laptop Face Recognition AI Online")
         print(f" - Camera Stream: {self.client.description}")
         print(f" - Feedback API: {self.hub.feedback_url}")
-        print(f" - Enrolled Faces: {len(self.engine.known_names)} loaded from {self.engine.faces_dir}")
-        print(f" - Hotkeys: Press 'e' in preview window to enroll, 'q' to quit")
+        print(f" - Face directory: {self.engine.faces_dir}")
+        if self.show_gui:
+            print(" - Hotkeys: Press 'e' in preview window to enroll, 'q' to quit")
         print("=" * 70 + "\n")
 
-        fps_timer = time.time()
-        fps_frame_counter = 0
-        window_name = "Smart Home Face Recognition - Camera 1"
-        preview_size = (960, 720)
-        painted_size = preview_size
-        painted_frame = None
-        current_bgr = None
-        verdict = {}
-
-        def paint_preview(frame, overlay):
-            nonlocal preview_size, painted_size, painted_frame
-            try:
-                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) == 0:
-                    return False
-                _, _, width, height = cv2.getWindowImageRect(window_name)
-                if width > 0 and height > 0:
-                    preview_size = width, height
-            except cv2.error:
-                # Some HighGUI backends do not expose the drawable size.
-                pass
-            if frame is not painted_frame or preview_size != painted_size:
-                cv2.imshow(window_name, self.draw_hud(frame, overlay, self.fps, preview_size))
-                painted_frame, painted_size = frame, preview_size
-            return True
-
-        if self.show_gui:
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
-            cv2.resizeWindow(window_name, *preview_size)
-            cv2.imshow(window_name, self.draw_hud(None, {}, 0.0, preview_size))
-
-        last_frame_number = 0
         preview_server = None
         preview_worker = None
         workers = []
@@ -392,79 +580,29 @@ class LaptopFaceBridge:
             self.hub.preview_port = preview_server.server_port
             print(f"[LAPTOP-HUB] Dashboard preview listening on TCP port {self.hub.preview_port}.", flush=True)
             preview_worker = threading.Thread(target=preview_server.serve_forever, daemon=True)
-            workers.append(preview_worker)
-            workers.append(threading.Thread(target=self.hub.run_feedback,
-                                            args=(self._stream_state, self._stop), daemon=True))
-            workers.append(threading.Thread(target=self._stream_reader_loop, daemon=True))
+            workers = [
+                preview_worker,
+                threading.Thread(target=self.hub.run_feedback,
+                                 args=(self._stream_state, self._stop), daemon=True),
+                threading.Thread(target=self._stream_reader_loop, daemon=True),
+                threading.Thread(target=self._analysis_loop, daemon=True),
+            ]
             for worker in workers:
                 worker.start()
 
-            while not self._stop.is_set():
-                with self._jpg_lock:
-                    jpg_bytes = self._latest_jpg
-                    frame_number = self.frames_count
-                    frame_at = self._latest_frame_at
-                    generation = self._stream_generation
-
-                camera_live = jpg_bytes is not None and time.monotonic() - frame_at <= 1.0
-                if not camera_live or frame_number == last_frame_number:
-                    if self.show_gui:
-                        if not paint_preview(current_bgr if camera_live else None, verdict):
-                            break
-                        if (cv2.waitKey(1) & 0xFF) in (27, ord('q'), ord('Q')):
-                            break
-                    self._stop.wait(0.02)
-                    continue
-
-                last_frame_number = frame_number
-                arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-                current_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if current_bgr is None:
-                    continue
-
-                # Run multi-scale AI face recognition
-                verdict = self.engine.analyze_frame(current_bgr)
-
-                now = time.time()
-                fps_frame_counter += 1
-                if now - fps_timer >= 1.0:
-                    self.fps = fps_frame_counter / (now - fps_timer)
-                    fps_frame_counter = 0
-                    fps_timer = now
-
-                self._observe_result(verdict, frame_at, generation)
-
-                # Display live GUI
-                if self.show_gui:
-                    if not paint_preview(current_bgr, verdict):
-                        break
-
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (27, ord('q'), ord('Q')):
-                        break
-                    elif key in (ord('e'), ord('E')):
-                        # Instant 1-Key Enrollment
-                        if verdict.get("faceDetected") and verdict.get("box") != [0, 0, 0, 0]:
-                            box = verdict.get("box")
-                            enroll_name = input("\n[ENROLL] Enter name for face in view: ").strip()
-                            if not enroll_name:
-                                enroll_name = f"User_{len(self.engine.known_names) + 1}"
-                            ok = self.engine.enroll(current_bgr, box, enroll_name)
-                            if ok:
-                                print(f"[ENROLL] Success! {enroll_name} is now authorized.\n")
-                        else:
-                            print("[ENROLL] Please look directly into the camera so a face is detected first.")
-                    elif key in (ord('r'), ord('R')):
-                        self.engine.load_known_faces()
-
-                time.sleep(0.005)
+            if self.show_gui:
+                self._preview_loop()
+            else:
+                # A bounded wait lets Ctrl+C through on older Windows Python builds.
+                while not self._stop.wait(0.25):
+                    pass
 
         except KeyboardInterrupt:
             pass
         finally:
             self.stop()
             if preview_server is not None:
-                if preview_worker.is_alive():
+                if preview_worker is not None and preview_worker.is_alive():
                     preview_server.shutdown()
                 preview_server.server_close()
             for worker in workers:
@@ -473,7 +611,6 @@ class LaptopFaceBridge:
             if self.show_gui:
                 cv2.destroyAllWindows()
             print("\n[LAPTOP-AI] Bridge stopped cleanly.")
-
 
 def main():
     parser = argparse.ArgumentParser(description="High-Speed Laptop Face Recognition Bridge for ESP32-CAM")
@@ -502,12 +639,15 @@ def main():
         parser.error("--baud must be positive")
     client = SerialCamera(args.uart_port, args.baud, args.resolution, args.jpeg_quality, args.light)
     hub = LaptopHubClient(args.hub, args.preview_bind, args.preview_port)
-    engine = FastFaceEngine(args.faces_dir, distance_thresh=args.thresh)
-    bridge = LaptopFaceBridge(client, engine, hub, show_gui=not args.no_gui)
+    engine = None
     try:
-        bridge.run()
+        engine = FaceWorker(args.faces_dir, args.thresh)
+        LaptopFaceBridge(client, engine, hub, show_gui=not args.no_gui).run()
     except OSError as exc:
         parser.exit(1, f"Laptop face bridge failed: {exc}\n")
+    finally:
+        if engine is not None:
+            engine.close()
 
 
 if __name__ == "__main__":

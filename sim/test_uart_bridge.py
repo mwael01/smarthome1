@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,13 +29,70 @@ class TestUartBridge(unittest.TestCase):
 
         with patch("tools.laptop_face_bridge.cv2.putText", wraps=cv2.putText) as draw_text:
             waiting = bridge.draw_hud(None, {}, 0.0)
-            live = bridge.draw_hud(frame, {"inferenceMs": 12}, 30.0, (640, 480))
+            live = bridge.draw_hud(frame, {}, 30.0, (640, 480), rx_fps=32.0, ai_fps=7.0)
 
         self.assertEqual(waiting.shape, (720, 960, 3))
         self.assertEqual(live.shape, (480, 640, 3))
         labels = [call.args[1] for call in draw_text.call_args_list]
         self.assertIn("COM5 (2000000 baud)", labels)
-        self.assertIn("320x240 source   |   Preview 30.0 FPS   |   AI 12 ms", labels)
+        self.assertIn("320x240  |  RX 32.0 FPS  |  Preview 30.0 FPS  |  AI 7.0 FPS", labels)
+
+    def test_preview_continues_while_recognition_waits(self):
+        _, encoded = cv2.imencode(".jpg", np.zeros((240, 320, 3), dtype=np.uint8))
+        jpeg = encoded.tobytes()
+        analysis_started = threading.Event()
+        release_analysis = threading.Event()
+
+        class Camera:
+            description = "Simulated serial camera"
+
+            def iter_jpegs(self, *, stop):
+                while not stop.wait(0.025):
+                    yield jpeg
+
+        class Engine:
+            def analyze_jpeg(self, jpeg):
+                analysis_started.set()
+                release_analysis.wait()
+                return {"result": "no_face"}
+
+        bridge = LaptopFaceBridge(Camera(), Engine(), Mock())
+        images = []
+        draw_hud = bridge.draw_hud
+
+        def draw(image, *args, **kwargs):
+            if image is not None and analysis_started.is_set():
+                images.append(image)
+                if len(images) >= 12:
+                    bridge.stop()
+            return draw_hud(image, *args, **kwargs)
+
+        workers = [threading.Thread(target=run) for run in
+                   (bridge._stream_reader_loop, bridge._analysis_loop)]
+        deadline = threading.Timer(3.0, bridge.stop)
+        for worker in workers:
+            worker.start()
+        deadline.start()
+        try:
+            with (
+                patch.multiple(cv2, namedWindow=Mock(), resizeWindow=Mock(), imshow=Mock(),
+                               getWindowProperty=Mock(return_value=1),
+                               getWindowImageRect=Mock(return_value=(0, 0, 640, 480)),
+                               waitKey=Mock(return_value=-1)),
+                patch.object(bridge, "draw_hud", side_effect=draw),
+            ):
+                bridge._preview_loop()
+            self.assertEqual(len(images), 12)
+            self.assertEqual(len({id(image) for image in images}), 12)
+            self.assertEqual(bridge._analyzed_count, 0)
+        finally:
+            deadline.cancel()
+            bridge.stop()
+            release_analysis.set()
+            for worker in workers:
+                worker.join(timeout=1.0)
+        bridge.hub.observe.assert_called_once()
+        self.assertEqual(bridge.hub.observe.call_args.args[0], {})
 
     def test_explicit_preview_port_reports_permission_error(self):
         error = PermissionError(errno.EACCES, "Access denied")
@@ -86,7 +143,7 @@ class TestUartBridge(unittest.TestCase):
             known_names = ["Tester"]
             result = "no_face"
 
-            def analyze_frame(self, image):
+            def analyze_jpeg(self, jpeg):
                 self_result = self.result
                 observations.append(self_result)
                 return {"result": self_result, "name": "Tester", "confidence": 0.9,
