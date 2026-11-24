@@ -15,6 +15,15 @@ namespace {
 constexpr size_t kMaxJpegSize = 128 * 1024;
 constexpr int kDefaultQuality = 16;
 constexpr uint32_t kLightTimeoutMs = 4000;
+#if defined(CAMERA_UART_LIGHT_PIN)
+constexpr int kProfileLightPin = CAMERA_UART_LIGHT_PIN;
+constexpr int kProfileWhiteLevel = 32;
+static_assert(kProfileLightPin == 38 || kProfileLightPin == 48,
+              "The camera light profile must use GPIO38 or GPIO48");
+#else
+constexpr int kProfileLightPin = -1;
+constexpr int kProfileWhiteLevel = 0;
+#endif
 constexpr uint8_t kFrameMagic[] = {0xff, 0xff, 0x00, 'U', 'S', 'B', 'C', '1'};
 
 // All numeric fields are little-endian on the ESP32-S3.
@@ -140,13 +149,19 @@ void applyCommand(const char *command) {
       quality < 10 || quality > 63) {
     return;
   }
-  int pin = -1;
+  int pin = kProfileLightPin;
   if (fields == 4) {
     if ((strcmp(pinName, "38") != 0 && strcmp(pinName, "48") != 0) ||
         white < 0 || white > 255) {
       return;
     }
     pin = atoi(pinName);
+    // Keep the stream usable if a stale command names the other profile's pin.
+    if (kProfileLightPin >= 0 && pin != kProfileLightPin) {
+      pin = -1;
+    }
+  } else {
+    white = kProfileWhiteLevel;
   }
   for (const Preset &preset : kPresets) {
     if (strcmp(name, preset.name) != 0) {

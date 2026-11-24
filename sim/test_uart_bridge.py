@@ -21,6 +21,21 @@ from tools.serial_camera import HEADER, MAGIC, SerialCamera
 
 
 class TestUartBridge(unittest.TestCase):
+    def test_serial_preview_renders_waiting_and_live_frames(self):
+        client = SerialCamera("COM5", 2_000_000, "qvga", 16)
+        bridge = LaptopFaceBridge(client, engine=None, hub=None)
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        with patch("tools.laptop_face_bridge.cv2.putText", wraps=cv2.putText) as draw_text:
+            waiting = bridge.draw_hud(None, {}, 0.0)
+            live = bridge.draw_hud(frame, {"inferenceMs": 12}, 30.0, (640, 480))
+
+        self.assertEqual(waiting.shape, (720, 960, 3))
+        self.assertEqual(live.shape, (480, 640, 3))
+        labels = [call.args[1] for call in draw_text.call_args_list]
+        self.assertIn("COM5 (2000000 baud)", labels)
+        self.assertIn("320x240 source   |   Preview 30.0 FPS   |   AI 12 ms", labels)
+
     def test_direct_preview_and_feedback_recover_independently(self):
         _, image = cv2.imencode(".jpg", np.zeros((240, 320, 3), dtype=np.uint8))
         jpeg = image.tobytes()
@@ -97,7 +112,7 @@ class TestUartBridge(unittest.TestCase):
 
         with ThreadingHTTPServer(("127.0.0.1", 0), Hub) as hub:
             engine = Engine()
-            client = SerialCamera("TEST", 2_000_000, "qvga", 16, light=(48, 32))
+            client = SerialCamera("TEST", 2_000_000, "qvga", 16)
             publisher = LaptopHubClient(f"127.0.0.1:{hub.server_port}", "127.0.0.1", 0)
             bridge = LaptopFaceBridge(client, engine, publisher, show_gui=False)
             hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
@@ -112,7 +127,7 @@ class TestUartBridge(unittest.TestCase):
                         frames = iter_jpegs(response)
                         self.assertEqual(next(frames), jpeg)
                         self.assertEqual(next(frames), jpeg)
-                    wait_for(lambda: serial_commands.count(b"\nSTART qvga 16 48 32\n") >= 2)
+                    wait_for(lambda: serial_commands.count(b"\nSTART qvga 16\n") >= 2)
 
                     hub_thread.start()
                     wait_for(lambda: posted("heartbeat"))

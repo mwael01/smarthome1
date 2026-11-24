@@ -107,6 +107,7 @@ def iter_serial_frames(port, resolution, quality, stop, timeout, parser, *, ligh
             if now - (last_frame_at if last_frame_at is not None else started) >= timeout:
                 width, height = dimensions
                 raise TimeoutError(f"No {width}×{height} frames for {timeout:g}s on {port.port}")
+            # Renew START because a firmware profile can turn on the light by default.
             if now >= next_command:
                 port.write(command)
                 next_command = now + 1.0
@@ -115,9 +116,6 @@ def iter_serial_frames(port, resolution, quality, stop, timeout, parser, *, ligh
             for frame in parser.feed(chunk):
                 if frame.dimensions == dimensions:
                     last_frame_at = time.monotonic()
-                    # Lit streams renew the light even while frames are arriving.
-                    if light is None:
-                        next_command = last_frame_at + 1.0
                     yield frame
     finally:
         try:

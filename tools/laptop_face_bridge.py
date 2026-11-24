@@ -333,10 +333,11 @@ class LaptopFaceBridge:
 
         if footer >= 25 and width >= 100:
             cv2.line(canvas, (0, height - footer), (width - 1, height - footer), (55, 48, 40))
-            stats = self.client.cam_ip
             if live:
                 stats = (f"{source_w}x{source_h} source   |   Preview {fps:.1f} FPS"
                          f"   |   AI {verdict.get('inferenceMs', 0)} ms")
+            else:
+                stats = self.client.description
             write(stats, 18, height - footer + 23, 0.52, text, width - 36)
             if footer >= 48 and width >= 210:
                 write("E  Enroll     R  Reload faces     Q  Quit", 18, height - 15, 0.46, muted, width - 36)

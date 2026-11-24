@@ -79,7 +79,7 @@ The camera targets are configured for the **ESP32-S3-CAM N16R8** with 16 MB of q
 
 The camera firmware uses the ESP32-S3-EYE camera pinout. If you have a different ESP32-S3 camera board, verify its schematic before wiring or flashing. On the Espressif ESP32-S3-EYE, use the onboard USB port for power and flashing.
 
-The serial firmware uses Adafruit NeoPixel for the camera board's one addressable RGB LED. Equal red, green, and blue values produce white. Select the LED data GPIO that your board actually uses. Espressif's original DevKitC-1 uses GPIO48 and v1.1 uses GPIO38. An unmarked camera board may wire it differently. The firmware waits for an explicit pin selection and turns the light off when the preview closes or stops renewing it. [Espressif RGB LED pin assignments](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html#hardware-revision-details) · [Adafruit NeoPixel Arduino guide](https://learn.adafruit.com/adafruit-neopixel-uberguide/arduino-library-use)
+The serial firmware uses Adafruit NeoPixel for the camera board's one addressable RGB LED. Equal red, green, and blue values produce white. Select the LED data GPIO that your board actually uses. Espressif's original DevKitC-1 uses GPIO48 and v1.1 uses GPIO38. An unmarked camera board may wire it differently. The light turns off when the preview closes or stops renewing it. [Espressif RGB LED pin assignments](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html#hardware-revision-details) · [Adafruit NeoPixel Arduino guide](https://learn.adafruit.com/adafruit-neopixel-uberguide/arduino-library-use)
 
 ---
 
@@ -108,12 +108,18 @@ pio device monitor -b 115200
 
 ## Run the integrated UART system on Windows
 
-In the PlatformIO terminal, use the COM ports from Device Manager. In this example the hub is `COM4` and the camera's CH340 is `COM5`.
+In VS Code, open **PlatformIO → Project Tasks**. For the hub, select **esp32dev → General → Upload**. To flash the camera, connect the CH340 programmer and close any preview or serial monitor using its COM port. Then expand the matching profile and select **General → Upload**. If both boards are connected, unplug the other board so PlatformIO can find the intended upload port automatically. [PlatformIO Project Tasks](https://docs.platformio.org/en/latest/integration/ide/vscode.html#project-tasks)
+
+| UART upload profile | LED data pin |
+| --- | --- |
+| `cam_face_stream_s3_uart_led38` | GPIO38 |
+| `cam_face_stream_s3_uart_led48` | GPIO48 |
+
+Both profiles start white illumination at level 32 out of 255 when the updated laptop preview or face bridge starts streaming. The generic `cam_face_stream_s3_standalone_uart` profile uses an explicit `--light GPIO LEVEL` option.
+
+Set up the laptop Python environment in PowerShell. In the preview commands below, replace `COM5` with the CH340 port from Device Manager.
 
 ```powershell
-pio run -e esp32dev -t upload --upload-port COM4
-pio run -e cam_face_stream_s3_standalone_uart -t upload --upload-port COM5
-
 py -3.11 -m venv "$env:LOCALAPPDATA\smarthome-face-venv"
 $facePython = "$env:LOCALAPPDATA\smarthome-face-venv\Scripts\python.exe"
 & $facePython -m pip install -r face_recigntion2\requirements.txt pyserial "setuptools<81"
@@ -129,7 +135,7 @@ Connect Windows to **SmartHome-Net** and open **http://192.168.4.1**. Close any 
 
 Press **E** in the preview to enroll a face. Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop. If the laptop preview works but the dashboard reports **PREVIEW UNREACHABLE**, allow inbound TCP **8080** for the bridge from the trusted local network in Windows Firewall. If port 8080 is in use, pass `--preview-port` with an available port.
 
-To turn on the camera light while recognition runs, add `--light GPIO LEVEL`. For a camera with the RGB LED data line on GPIO48, try level 32 first. Select 38 in the command if your board uses GPIO38. The level range is 0–255.
+To adjust brightness, add `--light GPIO LEVEL` with the GPIO from the uploaded profile. Use level 0 to keep the light off. The level range is 0–255.
 
 ```powershell
 & $facePython tools\laptop_face_bridge.py --uart-port COM5 --resolution qvga --light 48 32
