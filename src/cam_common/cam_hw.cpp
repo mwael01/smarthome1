@@ -20,7 +20,9 @@ constexpr int FLASH_LEDC_CHANNEL = 2; // Avoid LEDC channel 0 used by camera XCL
 constexpr int MAX_STREAM_CLIENTS = 4;
 constexpr size_t PART_HEADER_RESERVE = 96;
 constexpr size_t PART_TRAILER_RESERVE = 2;
-constexpr unsigned long FRAME_SEND_TIMEOUT_MS = 250;
+constexpr size_t TCP_SEND_CHUNK_BYTES = 4096;
+constexpr unsigned long FRAME_SEND_STALL_MS = 750;
+constexpr unsigned long FRAME_SEND_LIMIT_MS = 1500;
 constexpr unsigned long FRAME_IDLE_TIMEOUT_MS = 3000;
 
 SemaphoreHandle_t s_previewMutex = nullptr;
@@ -49,17 +51,24 @@ void camInitCore0Task(void *arg) {
   vTaskDelete(nullptr);
 }
 
-// Close a viewer that cannot send a full frame within the latency budget.
+// Allow a frame to finish through brief Wi-Fi stalls while bounding the time
+// spent on a blocked viewer. A partially sent frame must finish or close.
 bool sendPacketAll(int fd, const uint8_t *buf, size_t len) {
   if (fd < 0) return false;
 
   size_t sent = 0;
   const unsigned long startMs = millis();
+  unsigned long lastProgressMs = startMs;
   while (sent < len) {
-    if (millis() - startMs >= FRAME_SEND_TIMEOUT_MS) return false;
-    ssize_t n = lwip_send(fd, buf + sent, len - sent, 0);
+    const unsigned long now = millis();
+    if (now - lastProgressMs >= FRAME_SEND_STALL_MS || now - startMs >= FRAME_SEND_LIMIT_MS) {
+      return false;
+    }
+    size_t chunk = min(len - sent, TCP_SEND_CHUNK_BYTES);
+    ssize_t n = lwip_send(fd, buf + sent, chunk, 0);
     if (n > 0) {
       sent += static_cast<size_t>(n);
+      lastProgressMs = millis();
     } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       vTaskDelay(1);
     } else {

@@ -22,6 +22,7 @@ When streaming from the ESP32-CAM:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import statistics
@@ -32,6 +33,10 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Keep the direct script entry point usable from the face demo directory.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from camera_stream import IncompleteJpegPart, iter_jpegs
 
 try:
     import cv2
@@ -48,6 +53,7 @@ except ImportError as exc:  # friendly message for a not-yet-set-up environment
 
 KNOWN_FACES_DIR = Path(__file__).resolve().parent / "known_faces"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+CAMERA_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # <identity>-<number>.<jpg|jpeg|png>  — greedy so a hyphenated name still works
 _IDENTITY_RE = re.compile(r"^(?P<name>.+)-\d+\.(?:jpe?g|png)$", re.IGNORECASE)
 _SUPPORTED = ("*.jpg", "*.jpeg", "*.png")
@@ -190,6 +196,8 @@ def run_camera(known: dict[str, list], tolerance: float) -> None:
         sys.exit(1)
 
     print("[camera] live recognition — Q to quit, SPACE to save a capture.")
+    cv2.namedWindow("Face Recognition", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Face Recognition", 800, 600)
     detect_every = 2           # recognize every Nth frame; boxes persist in between
     results: list[tuple] = []  # last detection result, redrawn on every frame
     frame_i = 0
@@ -221,53 +229,50 @@ class EspStreamReader:
     def __init__(self, stream_url: str):
         self.stream_url = stream_url
         self.latest_frame: np.ndarray | None = None
+        self.latest_frame_at = 0.0
         self.lock = threading.Lock()
-        self.running = True
+        self.stopped = threading.Event()
         self.connected = False
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
     def _worker(self):
-        while self.running:
+        while not self.stopped.is_set():
+            retry_delay = 1.0
             try:
-                req = urllib.request.Request(self.stream_url)
-                with urllib.request.urlopen(req, timeout=4.0) as resp:
-                    self.connected = True
-                    buf = bytearray()
-                    while self.running:
-                        chunk = resp.read(8192)
-                        if not chunk:
+                with CAMERA_HTTP.open(self.stream_url, timeout=4.0) as response:
+                    for jpeg in iter_jpegs(response, skip_damaged=True):
+                        if self.stopped.is_set():
                             break
-                        buf.extend(chunk)
-                        while True:
-                            soi = buf.find(b"\xff\xd8")
-                            if soi < 0:
-                                if len(buf) > 65536:
-                                    del buf[:-2]
-                                break
-                            eoi = buf.find(b"\xff\xd9", soi + 2)
-                            if eoi < 0:
-                                if soi > 0:
-                                    del buf[:soi]
-                                break
-                            jpg = bytes(buf[soi : eoi + 2])
-                            del buf[: eoi + 2]
-                            arr = np.frombuffer(jpg, dtype=np.uint8)
-                            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                            if frame is not None:
-                                with self.lock:
-                                    self.latest_frame = frame
-            except Exception:
-                self.connected = False
-                if self.running:
-                    time.sleep(1.0)
+                        try:
+                            frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        except cv2.error:
+                            continue
+                        if frame is not None:
+                            with self.lock:
+                                self.latest_frame = frame
+                                self.latest_frame_at = time.monotonic()
+                                self.connected = True
+                            retry_delay = 0.2
+            except IncompleteJpegPart:
+                retry_delay = 0.2
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                if not self.stopped.is_set():
+                    print(f"[esp-stream] Reconnecting ({exc})", file=sys.stderr)
+            finally:
+                with self.lock:
+                    self.latest_frame = None
+                    self.connected = False
+            self.stopped.wait(retry_delay)
 
     def get_frame(self) -> np.ndarray | None:
         with self.lock:
-            return self.latest_frame
+            if time.monotonic() - self.latest_frame_at <= 1.5:
+                return self.latest_frame
+            return None
 
     def stop(self):
-        self.running = False
+        self.stopped.set()
 
 
 def send_esp_feedback(
@@ -303,7 +308,7 @@ def send_esp_feedback(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=1.2) as resp:
+        with CAMERA_HTTP.open(req, timeout=1.2) as resp:
             pass
     except Exception:
         pass
@@ -376,18 +381,22 @@ def run_esp(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(sync_req, timeout=1.5) as resp:
+        with CAMERA_HTTP.open(sync_req, timeout=1.5) as resp:
             pass
     except Exception:
         pass
 
     reader = EspStreamReader(stream_url)
     window_name = "Smart Home Security — ESP32 Face Recognition"
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 800, 600)
 
     results: list[tuple] = []
     detect_every = 2
     frame_i = 0
+    fps_frames = 0
+    last_frame = None
+    infer_ms = 0
     fps_timer = time.time()
     fps = 0.0
     last_feedback_time = 0.0
@@ -397,29 +406,40 @@ def run_esp(
         while True:
             frame = reader.get_frame()
             if frame is None:
+                last_frame = None
+                results = []
                 # Show waiting screen
                 wait_screen = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(wait_screen, "Connecting to ESP32-CAM...", (80, 220),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 cv2.putText(wait_screen, f"Target: {stream_url}", (80, 260),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-                cv2.putText(wait_screen, "Ensure laptop Wi-Fi is connected to 'SmartHome-Net'", (80, 300),
+                network = "SmartHome-FaceCam" if cam_ip == "192.168.11.1" else "SmartHome-Net"
+                cv2.putText(wait_screen, f"Connect the laptop to {network}", (80, 300),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (150, 150, 150), 1)
                 cv2.imshow(window_name, wait_screen)
-                if cv2.waitKey(200) & 0xFF == ord("q"):
+                if (cv2.waitKey(30) & 0xFF) in (ord("q"), 27):
                     break
                 continue
 
             now = time.time()
             if now - fps_timer >= 1.0:
-                fps = frame_i / (now - fps_timer)
-                frame_i = 0
+                fps = fps_frames / (now - fps_timer)
+                fps_frames = 0
                 fps_timer = now
 
-            t0 = time.time()
-            if frame_i % detect_every == 0:
+            fresh_frame = frame is not last_frame
+            analyzed_frame = fresh_frame and (
+                last_frame is None or frame.shape != last_frame.shape or frame_i % detect_every == 0
+            )
+            if analyzed_frame:
+                t0 = time.perf_counter()
                 results = recognize(frame, known, tolerance)
-            infer_ms = int((time.time() - t0) * 1000.0)
+                infer_ms = int((time.perf_counter() - t0) * 1000.0)
+            if fresh_frame:
+                last_frame = frame
+                frame_i += 1
+                fps_frames += 1
 
             # Draw recognition boxes and labels
             display_frame = frame.copy()
@@ -438,7 +458,7 @@ def run_esp(
                         (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 230, 230), 1, cv2.LINE_AA)
 
             # Determine decision and transmit to ESP32-CAM
-            if results:
+            if analyzed_frame and results:
                 # Prioritize any authorized match
                 matched = next((r for r in results if r[4] != "Unknown"), None)
                 if matched:
@@ -459,7 +479,7 @@ def run_esp(
                         last_feedback_time = now
                         last_verdict_sent = "unknown"
                         print("[ACCESS DENIED] Unknown Person Detected -> Hub Intruder Siren Armed")
-            else:
+            elif analyzed_frame:
                 # No face in view - send idle keepalive every 2.5s
                 if now - last_feedback_time >= 2.5:
                     send_esp_feedback(base_url, "no_face", "---", None, None, 0)
@@ -468,7 +488,7 @@ def run_esp(
 
             cv2.imshow(window_name, display_frame)
 
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(1 if fresh_frame else 10) & 0xFF
             if key in (ord("q"), 27):
                 break
             elif key == ord(" "):
@@ -485,8 +505,6 @@ def run_esp(
                             print(f"[enroll] Enrolled! {len(known)} active identities in database.\n")
                 else:
                     print("[enroll] Look directly into the camera so a face is detected first.")
-
-            frame_i += 1
 
     except KeyboardInterrupt:
         pass

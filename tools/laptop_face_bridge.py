@@ -30,9 +30,9 @@ import face_recognition
 import numpy as np
 
 if __package__:
-    from .camera_stream import RESOLUTIONS, iter_jpegs, set_video_config
+    from .camera_stream import IncompleteJpegPart, RESOLUTIONS, iter_jpegs, set_video_config
 else:
-    from camera_stream import RESOLUTIONS, iter_jpegs, set_video_config
+    from camera_stream import IncompleteJpegPart, RESOLUTIONS, iter_jpegs, set_video_config
 
 
 class EspCamStreamClient:
@@ -108,7 +108,7 @@ class EspCamStreamClient:
         """Yield raw JPEG byte buffers from the ESP32-CAM multipart MJPEG stream."""
         req = urllib.request.Request(self.stream_url)
         with self._opener.open(req, timeout=timeout) as resp:
-            yield from iter_jpegs(resp)
+            yield from iter_jpegs(resp, skip_damaged=True)
 
     def configure_video(self, resolution=None, quality=None):
         set_video_config(self._opener, self.base_url, resolution, quality)
@@ -315,6 +315,7 @@ class LaptopFaceBridge:
 
     def _stream_reader_loop(self):
         while not self._stop.is_set():
+            retry_delay = 1.0
             try:
                 for jpg in self.client.iter_mjpeg_frames():
                     if self._stop.is_set():
@@ -323,13 +324,16 @@ class LaptopFaceBridge:
                         self._latest_jpg = jpg
                         self._latest_frame_at = time.monotonic()
                         self.frames_count += 1
+                    retry_delay = 0.2
+            except IncompleteJpegPart:
+                retry_delay = 0.2
             except Exception as exc:
                 if not self._stop.is_set():
                     print(f"[LAPTOP-AI] Stream reconnecting ({exc})...", file=sys.stderr)
             finally:
                 with self._jpg_lock:
                     self._latest_jpg = None
-            self._stop.wait(1.0)
+            self._stop.wait(retry_delay)
 
     def _status_sync_loop(self):
         """Periodically sync enrolled names and ESP-CAM commands in the background."""
@@ -501,7 +505,8 @@ class LaptopFaceBridge:
         window_name = "Smart Home Face Recognition - Camera 1"
 
         if self.show_gui:
-            cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 800, 600)
 
         last_frame_number = 0
 
