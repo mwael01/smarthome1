@@ -1,4 +1,4 @@
-"""Serial camera input, laptop HTTP preview, and Wi-Fi hub feedback."""
+"""Laptop HTTP preview and Wi-Fi hub feedback for the face bridge."""
 
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,26 +9,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-if __package__:
-    from .usb_camera_preview import FrameParser, iter_serial_frames, open_camera_port
-else:
-    from usb_camera_preview import FrameParser, iter_serial_frames, open_camera_port
-
-
 FRAME_MAX_AGE = 1.5
 UNKNOWN_CONFIRMATIONS = 3
 EVENT_COOLDOWN = {"recognized": 2.5, "unknown": 4.0}
 
 
-class UartFaceClient:
-    def __init__(self, port, baud, resolution, quality, hub, preview_bind, preview_port):
-        self.port = port
-        self.baud = baud
-        self.resolution = resolution
-        self.quality = quality
+class LaptopHubClient:
+    def __init__(self, hub, preview_bind, preview_port):
         self.preview_bind = preview_bind
         self.preview_port = preview_port
-        self.stream_url = f"{port} ({baud} baud)"
         self.feedback_url = f"http://{hub}/api/laptop/event"
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self._sequence = secrets.randbelow(0x7ffffffe)
@@ -37,11 +26,6 @@ class UartFaceClient:
         self._last_observation = 0.0
         self._unknown_count = 0
         self._verdict = None
-
-    def iter_mjpeg_frames(self, *, stop):
-        with open_camera_port(self.port, uart=True, baud=self.baud) as port:
-            for frame in iter_serial_frames(port, self.resolution, self.quality, stop, 5, FrameParser()):
-                yield frame.jpeg
 
     def observe(self, verdict, frame_at):
         """Keep only the newest actionable result from a fresh camera frame."""
@@ -103,13 +87,13 @@ class UartFaceClient:
                 try:
                     self._post(event, version, verdict)
                     if link_failed:
-                        print("[UART-CAM] Hub Wi-Fi connection restored", flush=True)
+                        print("[LAPTOP-HUB] Hub Wi-Fi connection restored", flush=True)
                     link_failed = False
                     if verdict is not None:
-                        print(f"[UART-CAM] Sent {event} to hub", flush=True)
+                        print(f"[LAPTOP-HUB] Sent {event} to hub", flush=True)
                 except OSError as exc:
                     if not link_failed:
-                        print(f"[UART-CAM] Hub unavailable ({exc}). Camera preview continues.", flush=True)
+                        print(f"[LAPTOP-HUB] Hub unavailable ({exc}). Camera preview continues.", flush=True)
                     link_failed = True
             stop.wait(0.1)
 

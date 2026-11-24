@@ -79,9 +79,7 @@ The camera targets are configured for the **ESP32-S3-CAM N16R8** with 16 MB of q
 
 The camera firmware uses the ESP32-S3-EYE camera pinout. If you have a different ESP32-S3 camera board, verify its schematic before wiring or flashing. On the Espressif ESP32-S3-EYE, use the onboard USB port for power and flashing.
 
-The ESP32-S3-EYE has no dedicated camera flash. GPIO2 is microphone data, GPIO48 is the LCD backlight, and GPIO3 is the module power indicator. Flash controls stay disabled until a verified flash-control GPIO is configured. [Espressif board guide](https://docs.espressif.com/projects/esp-board-manager/en/latest/references/boards/esp32_s3_eye.html) · [Espressif pin map](https://github.com/espressif/esp-bsp/blob/master/bsp/esp32_s3_eye/esp32_s3_eye.json)
-
-For an external light, use a driver with a 3.3 V-compatible active-high PWM input. Wire the verified GPIO to the driver input, share ground between the camera and driver, and power the light from its rated supply through the driver. Set `-DCAM_HW_FLASH_LED_PIN=<verified GPIO>` in the camera build flags.
+The serial firmware uses Adafruit NeoPixel for the camera board's one addressable RGB LED. Equal red, green, and blue values produce white. Select the LED data GPIO that your board actually uses. Espressif's original DevKitC-1 uses GPIO48 and v1.1 uses GPIO38. An unmarked camera board may wire it differently. The firmware waits for an explicit pin selection and turns the light off when the preview closes or stops renewing it. [Espressif RGB LED pin assignments](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html#hardware-revision-details) · [Adafruit NeoPixel Arduino guide](https://learn.adafruit.com/adafruit-neopixel-uberguide/arduino-library-use)
 
 ---
 
@@ -131,36 +129,13 @@ Connect Windows to **SmartHome-Net** and open **http://192.168.4.1**. Close any 
 
 Press **E** in the preview to enroll a face. Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop. If the laptop preview works but the dashboard reports **PREVIEW UNREACHABLE**, allow inbound TCP **8080** for the bridge from the trusted local network in Windows Firewall. If port 8080 is in use, pass `--preview-port` with an available port.
 
-### Wi-Fi camera bench mode
+To turn on the camera light while recognition runs, add `--light GPIO LEVEL`. For a camera with the RGB LED data line on GPIO48, try level 32 first. Select 38 in the command if your board uses GPIO38. The level range is 0–255.
 
-| Mode | Camera firmware | Wi-Fi | Direct MJPEG preview |
-| --- | --- | --- | --- |
-| Standalone | `cam_face_stream_s3_standalone` | `SmartHome-FaceCam` | `http://192.168.11.1:81/stream` |
-| Legacy Wi-Fi streaming | `cam_face_stream_s3` | `SmartHome-Net` | `http://192.168.4.101:81/stream` |
-
-Both Wi-Fi networks use `smarthome123`. The camera's port 80 root redirects to the raw stream. Its control and recognition API stays on port 80. The hub dashboard remains at `http://192.168.4.1`. The integrated camera starts its fallback hotspot if it cannot join the hub after about 12 seconds.
-
-Start the laptop face bridge with the low-bandwidth profile. Omit `--standalone` on `SmartHome-Net`.
-
-```bash
-python3 tools/laptop_face_bridge.py --standalone --resolution qvga --jpeg-quality 16
+```powershell
+& $facePython tools\laptop_face_bridge.py --uart-port COM5 --resolution qvga --light 48 32
 ```
 
-QVGA is 320×240. Use `hvga` (480×320) or `vga` (640×480) if the recognition model needs more detail. Higher JPEG quality numbers send smaller images. The camera saves explicit settings and uses QVGA on a fresh configuration. Press **E** in the laptop preview to enroll a face.
-
-The N16R8 profile uses sensor JPEG over HTTP MJPEG, 20 MHz camera XCLK, and two PSRAM frame buffers with latest-frame capture when the sensor supports JPEG. This follows Espressif's streaming example. The module's memory marking does not identify the sensor. On port 80, `/api/status` reports `sensorPid`, `captureMode`, `frameBuffers`, `flashBytes`, and `psramBytes`. Look for `sensor_jpeg`, two buffers, and 8 MiB of PSRAM on a JPEG-capable N16R8 build. [Espressif CameraWebServer example](https://github.com/espressif/arduino-esp32/blob/2.0.17/libraries/ESP32/examples/Camera/CameraWebServer/CameraWebServer.ino)
-
-For a raw receiver test, close other viewers and run the following command. Use `192.168.4.101` for the integrated mode.
-
-```bash
-python3 tools/test_camera_stream.py --url http://192.168.11.1:81/stream --frames 300 --resolution qvga --jpeg-quality 16
-```
-
-Compare received FPS and the longest gap between frames at each resolution. Repeat with the hub preview or laptop AI running to measure the extra load. Compare those results with `fps` (valid camera captures) and `publishFps` (frames made available to viewers) in `/api/status`.
-
-To identify the white flashlight's control pin, run `python3 tools/identify_flash_gpio.py`. The script guides unpowered multimeter measurements and flags pins shared with boot, memory, camera, USB, or UART signals. It uses the readings you enter and requires no connection to the ESP. A continuity match identifies a connection to the selected control point. Verify the circuit and active level before configuring a firmware output. [Espressif GPIO restrictions](https://docs.espressif.com/projects/esp-idf/en/v4.4.1/esp32s3/api-reference/peripherals/gpio.html) · [Fluke continuity guidance](https://www.fluke.com/en-sg/learn/blog/electrical/what-is-continuity)
-
-### Standalone USB camera test
+### Standalone USB and UART camera tests
 
 For the 30–40 FPS trial at HVGA (480×320), use the camera board's native USB connector if it exposes the ESP32-S3 USB data pins. The ESP32-S3 provides full-speed USB on GPIO20 (D+) and GPIO19 (D−). The separate CH340 programmer connects to UART0 and has its own test build. At its rated 2 Mbaud with 8N1 framing, it carries at most 195 KiB/s, or about 4.9 KiB per frame at 40 FPS before packet overhead. [Espressif USB device documentation](https://docs.espressif.com/projects/esp-usb/en/latest/esp32s3/usb_device.html) · [WCH CH340 datasheet](https://datasheet.lcsc.com/lcsc/2304140030_WCH-Jiangsu-Qin-Heng-CH340C_C84681.pdf)
 
@@ -178,6 +153,12 @@ pio run -e cam_face_stream_s3_standalone_uart -t upload
 python3 tools/usb_camera_preview.py --port /dev/ttyUSB0 --uart --resolution qvga
 ```
 
+The standalone preview accepts the same `--light GPIO LEVEL` option. On Windows, replace the COM port and select the verified data pin.
+
+```powershell
+& $facePython tools\usb_camera_preview.py --port COM5 --uart --resolution qvga --light 48 32
+```
+
 If the adapter or laptop driver is unreliable at 2 Mbaud, build and upload with `PLATFORMIO_BUILD_FLAGS=-DCAMERA_USB_UART_BAUD=921600` and add `--baud 921600` to the preview command.
 
 Measure reception without preview scaling or JPEG decoding. Repeat with `--resolution qvga` and `--resolution vga` to find the largest profile that sustains your target. Higher `--jpeg-quality` numbers use stronger compression. Compare settings in the same lighting and scene, as exposure and JPEG size affect throughput. Remove `--no-gui` for the resizable live preview.
@@ -190,7 +171,7 @@ The receiver reports verified FPS, byte rate, gaps between frames, and damaged p
 
 ### Internet access while streaming
 
-The camera and hub hotspots carry local traffic. Keep a separate internet connection on the laptop, such as Ethernet, and reconnect to the ESP hotspot to renew its DHCP lease after updating the firmware. The laptop tools connect directly to the ESP IP and bypass system HTTP proxies. If the host still prefers the hotspot for DNS, configure that Wi-Fi profile as local-only and use DNS from the internet-connected interface.
+The hub hotspot carries local dashboard and recognition traffic. Use Ethernet for internet access while connected to the hotspot, or connect the laptop and hub to your home Wi-Fi and pass the hub's address with `--hub`.
 
 ---
 
@@ -201,11 +182,11 @@ The camera and hub hotspots carry local traffic. Keep a separate internet connec
 ├── platformio.ini                 # Main hub and ESP32-S3 face-stream environments
 ├── ├── include/
 │   ├── smart_home_json.h          # Shared JSON string escaping helper
-│   └── smart_home_protocol.h      # Shared Wi-Fi SoftAP & ESP-NOW CamEventPacket definitions
+│   └── smart_home_protocol.h      # Hub hotspot and face event definitions
 ├── src/
-│   ├── main.cpp                   # Main Hub firmware (sensors, servos, SoftAP, ESP-NOW, Web UI)
-│   ├── cam_common/                # Shared camera hardware, JPEG stream, and network code
-│   └── cam_face_stream/
-│       └── main.cpp               # ESP32-S3 MJPEG stream and laptop-AI bridge
+│   ├── main.cpp                   # Main hub firmware (sensors, servos, Wi-Fi dashboard)
+│   ├── cam_common/                # Serial camera capture and sensor pinout
+│   └── cam_usb_stream/
+│       └── main.cpp               # ESP32-S3 USB CDC and CH340 UART camera firmware
 └── README.md                      # Project documentation
 ```

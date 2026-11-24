@@ -23,7 +23,6 @@
 #include <WiFi.h>
 #include <SPI.h>
 #include <MFRC522.h>
-#include <esp_now.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <sys/time.h>
@@ -400,20 +399,6 @@ bool laptopConnected(unsigned long now) {
   return laptopCamera.seen && now - laptopCamera.lastSeenMs <= LAPTOP_TIMEOUT_MS;
 }
 
-// ESP-NOW Rx Queue
-struct IncomingCamPacket {
-  SmartHomeNet::CamEventPacket pkt;
-  uint8_t srcMac[6];
-};
-
-constexpr size_t RX_QUEUE_CAP = 8;
-portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
-IncomingCamPacket rxQueue[RX_QUEUE_CAP];
-volatile size_t rxHead = 0;
-volatile size_t rxTail = 0;
-volatile uint32_t rxDropped = 0;
-bool espNowReady = false;
-
 WebServer server(80);
 
 // ---------------------------------------------------------------------------
@@ -479,48 +464,6 @@ void saveConfigToNvs() {
   prefs.putString("sta_ssid", g_cfg.staSsid);
   prefs.putString("sta_pass", g_cfg.staPass);
   prefs.end();
-}
-
-// ---------------------------------------------------------------------------
-// ESP-NOW Receive Callback (Core 2.0.x API)
-// ---------------------------------------------------------------------------
-void onEspNowRecv(const uint8_t *mac_addr, const uint8_t *data, int len) {
-  if (!data || len != static_cast<int>(sizeof(SmartHomeNet::CamEventPacket))) {
-    return;
-  }
-  SmartHomeNet::CamEventPacket pkt;
-  memcpy(&pkt, data, sizeof(pkt));
-  if (pkt.magic != SmartHomeNet::PACKET_MAGIC) {
-    return;
-  }
-  pkt.label[sizeof(pkt.label) - 1] = '\0';
-
-  portENTER_CRITICAL(&rxMux);
-  size_t nextHead = (rxHead + 1) % RX_QUEUE_CAP;
-  if (nextHead == rxTail) {
-    rxDropped++;
-  } else {
-    rxQueue[rxHead].pkt = pkt;
-    if (mac_addr) {
-      memcpy(rxQueue[rxHead].srcMac, mac_addr, 6);
-    } else {
-      memset(rxQueue[rxHead].srcMac, 0, 6);
-    }
-    rxHead = nextHead;
-  }
-  portEXIT_CRITICAL(&rxMux);
-}
-
-bool popCamPacket(IncomingCamPacket &out) {
-  bool hasItem = false;
-  portENTER_CRITICAL(&rxMux);
-  if (rxTail != rxHead) {
-    out = rxQueue[rxTail];
-    rxTail = (rxTail + 1) % RX_QUEUE_CAP;
-    hasItem = true;
-  }
-  portEXIT_CRITICAL(&rxMux);
-  return hasItem;
 }
 
 // ---------------------------------------------------------------------------
@@ -888,62 +831,6 @@ void handleCamEvent(const SmartHomeNet::CamEventPacket &pkt, unsigned long now) 
   }
 }
 
-// ---------------------------------------------------------------------------
-// Web API: Dual-Path Camera Event Endpoint (/api/cam/event)
-// Receives JSON access control events from camera nodes as an HTTP backup to ESP-NOW
-// ---------------------------------------------------------------------------
-void handleApiCamEvent() {
-  if (server.method() != HTTP_POST) {
-    server.send(405, "text/plain", "Method Not Allowed");
-    return;
-  }
-  if (!server.hasArg("plain")) {
-    server.send(400, "text/plain", "Missing body");
-    return;
-  }
-  String body = server.arg("plain");
-
-  int source = SmartHomeNet::CAM_SOURCE_FACE;
-  int event = SmartHomeNet::CAM_EVENT_HEARTBEAT;
-  int matchId = -1;
-  int confidence = 100;
-  uint32_t seq = 0;
-  char label[24] = "none";
-
-  int intVal = 0;
-  if (smartHomeJsonGetInt(body, "source", intVal)) source = intVal;
-  if (smartHomeJsonGetInt(body, "event", intVal)) event = intVal;
-  if (smartHomeJsonGetInt(body, "matchId", intVal)) matchId = intVal;
-  if (smartHomeJsonGetInt(body, "confidence", intVal)) confidence = intVal;
-  if (smartHomeJsonGetInt(body, "seq", intVal) && intVal >= 0) seq = static_cast<uint32_t>(intVal);
-  smartHomeJsonGetString(body, "label", label, sizeof(label));
-
-  if (source != SmartHomeNet::CAM_SOURCE_FACE ||
-      (event != SmartHomeNet::CAM_EVENT_RECOGNIZED &&
-       event != SmartHomeNet::CAM_EVENT_UNKNOWN &&
-       event != SmartHomeNet::CAM_EVENT_HEARTBEAT)) {
-    server.send(400, "application/json", "{\"error\":\"unsupported camera event\"}");
-    return;
-  }
-
-  SmartHomeNet::CamEventPacket pkt = {};
-  pkt.magic = SmartHomeNet::PACKET_MAGIC;
-  pkt.source = static_cast<uint8_t>(source);
-  pkt.event = static_cast<uint8_t>(event);
-  pkt.matchId = static_cast<int16_t>(matchId);
-  pkt.confidence = static_cast<uint8_t>(constrain(confidence, 0, 100));
-  pkt.seq = seq;
-  strncpy(pkt.label, label, sizeof(pkt.label) - 1);
-  pkt.label[sizeof(pkt.label) - 1] = '\0';
-
-  unsigned long now = millis();
-  if (!laptopConnected(now)) {
-    handleCamEvent(pkt, now);
-  }
-
-  server.send(200, "application/json", "{\"status\":\"ok\",\"path\":\"http\"}");
-}
-
 // The browser gets the preview from the Wi-Fi peer that registered it.
 bool readIntegerArg(const char *name, long minimum, long maximum, long &value) {
   String arg = server.arg(name);
@@ -1025,11 +912,6 @@ void handleApiStatus() {
   strftime(timeOnly, sizeof(timeOnly), "%H:%M:%S", &ti);
   bool pirSchedActive = g_cfg.pirScheduleEnabled ? isPirScheduleActive() : true;
 
-  uint32_t droppedSnapshot = 0;
-  portENTER_CRITICAL(&rxMux);
-  droppedSnapshot = rxDropped;
-  portEXIT_CRITICAL(&rxMux);
-
   char uptimeBuf[16];
   formatUptime(now / 1000, uptimeBuf, sizeof(uptimeBuf));
 
@@ -1072,7 +954,6 @@ void handleApiStatus() {
   json += "\"servo2\":" + String(currentServo2Angle) + ",";
   json += "\"doorOpen\":" + String(doorOpen ? "true" : "false") + ",";
   json += "\"door3\":" + String(currentDoor3Angle) + ",";
-  json += "\"rxDropped\":" + String(droppedSnapshot) + ",";
 
   // Wi-Fi Telemetry
   bool staConnected = (WiFi.status() == WL_CONNECTED);
@@ -1739,7 +1620,6 @@ void handleRoot() {
       <div class="row"><span class="k">System Clock</span><span id="sysClockText" class="v">12:00:00 PM</span></div>
       <div class="row"><span class="k">System Uptime</span><span id="sysUptime" class="v">00:00:00</span></div>
       <div class="row"><span class="k">Free Heap Memory</span><span id="sysHeap" class="v">-- KB</span></div>
-      <div class="row"><span class="k">ESP-NOW Dropped</span><span id="rxDropped" class="v">0</span></div>
     </div>
   </div>
 
@@ -2093,7 +1973,6 @@ async function refreshStatus(){
     document.getElementById('staStatus').textContent = d.wifi.staConnected ? (d.wifi.staSsid + " (" + d.wifi.staIp + ", " + d.wifi.staRssi + " dBm)") : (d.wifi.staSsid ? "Connecting..." : "Disabled");
     document.getElementById('sysUptime').textContent = d.uptimeStr;
     document.getElementById('sysHeap').textContent = Math.round(d.freeHeap/1024) + " KB";
-    document.getElementById('rxDropped').textContent = d.rxDropped;
 
     // Camera 1 (Face Cam) Telemetry
     updateCameraPreview(d.faceCam.streamUrl);
@@ -2239,7 +2118,7 @@ setInterval(refreshStatus, 1000);
 }
 
 // ---------------------------------------------------------------------------
-// Wi-Fi & ESP-NOW Initialization
+// Wi-Fi initialization
 // ---------------------------------------------------------------------------
 void onWiFiEvent(WiFiEvent_t event) {
   if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
@@ -2354,14 +2233,6 @@ void setup() {
   // Network initialization
   initHubWiFi();
 
-  // ESP-NOW
-  if (esp_now_init() == ESP_OK) {
-    esp_now_register_recv_cb(onEspNowRecv);
-    espNowReady = true;
-  } else {
-    Serial.println("ERROR: esp_now_init failed on Hub!");
-  }
-
   // Web Server Routes
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleApiStatus);
@@ -2369,7 +2240,6 @@ void setup() {
   server.on("/api/config", HTTP_POST, handleApiConfig);
   server.on("/api/time", HTTP_POST, handleApiTime);
   server.on("/api/wifi", HTTP_POST, handleApiWifi);
-  server.on("/api/cam/event", HTTP_POST, handleApiCamEvent);
   server.on("/api/laptop/event", HTTP_POST, handleApiLaptopEvent);
   server.begin();
 
@@ -2397,20 +2267,10 @@ void sampleSmokeSensor(unsigned long now) {
 // Main Loop
 // ---------------------------------------------------------------------------
 void loop() {
-  // 1. Process legacy camera events when a UART laptop is absent.
-  unsigned long now = millis();
-  IncomingCamPacket item;
-  while (popCamPacket(item)) {
-    if (!laptopConnected(now)) {
-      handleCamEvent(item.pkt, now);
-    }
-  }
-
-  // 2. Service WebServer requests
   server.handleClient();
-  now = millis();
+  unsigned long now = millis();
 
-  // 3. Read safety sensors. MQ-2 AO uses ADC1 so Wi-Fi can stay active.
+  // Read safety sensors. MQ-2 AO uses ADC1 so Wi-Fi can stay active.
   lastFlameDigital = digitalRead(FIRE_SENSOR_PIN);
   lastMotionDetected = (digitalRead(PIR_SENSOR_PIN) == HIGH);
 

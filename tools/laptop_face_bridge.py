@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Recognize faces from the serial camera or the legacy Wi-Fi MJPEG stream."""
+"""Recognize faces from the serial camera and send verdicts to the Wi-Fi hub."""
 
 import argparse
-import json
 import os
 import sys
 import threading
 import time
-import urllib.request
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import dlib
@@ -16,88 +14,13 @@ import face_recognition
 import numpy as np
 
 if __package__:
-    from .camera_stream import IncompleteJpegPart, RESOLUTIONS, iter_jpegs, set_video_config
+    from .camera_stream import RESOLUTIONS
+    from .laptop_hub import FRAME_MAX_AGE, LaptopHubClient, make_preview_server
+    from .serial_camera import SerialCamera, UART_BAUD, add_light_argument, validate_light
 else:
-    from camera_stream import IncompleteJpegPart, RESOLUTIONS, iter_jpegs, set_video_config
-
-
-class EspCamStreamClient:
-    """HTTP control & MJPEG stream client for the cam_face_stream ESP32-CAM node."""
-
-    def __init__(self, cam_ip: Optional[str] = None, http_port: int = 80,
-                 stream_port: int = 81, *, standalone: bool = False):
-        cam_ip = cam_ip or ("192.168.11.1" if standalone else "192.168.4.101")
-        self.cam_ip = cam_ip
-        self.standalone = standalone or cam_ip == "192.168.11.1"
-        self.base_url = f"http://{cam_ip}:{http_port}"
-        self.stream_url = f"http://{cam_ip}:{stream_port}/stream"
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    def _post_json(self, path: str, payload: Optional[dict] = None, timeout: float = 1.5) -> dict:
-        data = json.dumps(payload or {}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}{path}",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with self._opener.open(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    def get_status(self, timeout: float = 1.5) -> dict:
-        with self._opener.open(f"{self.base_url}/api/status", timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    def send_result(
-        self,
-        result: str,
-        match_id: int = -1,
-        name: str = "---",
-        confidence: float = 0.0,
-        face_detected: bool = False,
-        face_quality: str = "NO_FACE",
-        box: Optional[List[int]] = None,
-        inference_ms: int = 0,
-        laptop_model: str = "Laptop-AI",
-        trigger_hub: bool = True,
-        force: bool = False,
-    ) -> dict:
-        payload = {
-            "result": result,
-            "matchId": int(match_id),
-            "name": name,
-            "confidence": float(confidence),
-            "faceDetected": bool(face_detected),
-            "faceQuality": face_quality,
-            "box": box or [0, 0, 0, 0],
-            "inferenceMs": int(inference_ms),
-            "laptopModel": laptop_model,
-            "triggerHub": bool(trigger_hub and not self.standalone),
-            "force": bool(force),
-        }
-        return self._post_json("/api/recognition/result", payload)
-
-    def sync_enrolled(self, enrolled: List[Dict[str, object]]) -> dict:
-        return self._post_json("/api/laptop/enrolled", {"enrolled": enrolled})
-
-    def ack_enroll(self, ok: bool, face_id: int, name: str, msg: str = "") -> dict:
-        return self._post_json(
-            "/api/enroll/ack",
-            {"ok": bool(ok), "id": int(face_id), "name": name, "msg": msg,
-             "triggerHub": not self.standalone},
-        )
-
-    def ack_command(self, seq: int) -> dict:
-        return self._post_json("/api/command/ack", {"seq": int(seq)})
-
-    def iter_mjpeg_frames(self, timeout: float = 5.0):
-        """Yield raw JPEG byte buffers from the ESP32-CAM multipart MJPEG stream."""
-        req = urllib.request.Request(self.stream_url)
-        with self._opener.open(req, timeout=timeout) as resp:
-            yield from iter_jpegs(resp, skip_damaged=True)
-
-    def configure_video(self, resolution=None, quality=None):
-        set_video_config(self._opener, self.base_url, resolution, quality)
+    from camera_stream import RESOLUTIONS
+    from laptop_hub import FRAME_MAX_AGE, LaptopHubClient, make_preview_server
+    from serial_camera import SerialCamera, UART_BAUD, add_light_argument, validate_light
 
 
 class FastFaceEngine:
@@ -269,27 +192,13 @@ class FastFaceEngine:
 
 
 class LaptopFaceBridge:
-    """Manages stream reader, AI analyzer, live OpenCV window, and ESP-CAM feedback API."""
+    """Keep the newest serial frame available to the detector and dashboard."""
 
-    def __init__(
-        self,
-        client,
-        engine: FastFaceEngine,
-        show_gui: bool = True,
-        feedback_interval_s: float = 0.35,
-        laptop_model: str = "Laptop-AI",
-        uart_mode: bool = False,
-    ):
+    def __init__(self, client, engine: FastFaceEngine, hub, show_gui: bool = True):
         self.client = client
         self.engine = engine
+        self.hub = hub
         self.show_gui = show_gui
-        self.feedback_interval_s = feedback_interval_s
-        self.laptop_model = laptop_model
-        self.uart_mode = uart_mode
-
-        self.last_status: dict = {}
-        self.last_feedback_time = 0.0
-        self.last_result_sent = "NONE"
         self.fps = 0.0
         self.frames_count = 0
 
@@ -309,31 +218,30 @@ class LaptopFaceBridge:
             if after is not None:
                 self._jpg_lock.wait_for(
                     lambda: self.frames_count != after or self._latest_jpg is None or self._stop.is_set(),
-                    timeout=1.5,
+                    timeout=FRAME_MAX_AGE,
                 )
             frame = self._latest_jpg if self.frames_count != after and self._recent_frame() else None
             return frame, self.frames_count
 
     def _recent_frame(self):
         return (self._latest_jpg is not None and not self._stop.is_set()
-                and time.monotonic() - self._latest_frame_at <= 1.5)
+                and time.monotonic() - self._latest_frame_at <= FRAME_MAX_AGE)
 
     def _stream_state(self):
         with self._jpg_lock:
             return self._recent_frame(), self._stream_generation
 
-    def _observe_uart_result(self, verdict, frame_at, generation):
+    def _observe_result(self, verdict, frame_at, generation):
         with self._jpg_lock:
-            if self._stream_generation == generation:
-                self.client.observe(verdict, frame_at)
+            if self._stream_generation != generation or not self._recent_frame():
+                return
+            self.hub.observe(verdict, frame_at)
 
     def _stream_reader_loop(self):
         while not self._stop.is_set():
             retry_delay = 1.0
             try:
-                frames = (self.client.iter_mjpeg_frames(stop=self._stop) if self.uart_mode
-                          else self.client.iter_mjpeg_frames())
-                for jpg in frames:
+                for jpg in self.client.iter_jpegs(stop=self._stop):
                     if self._stop.is_set():
                         break
                     with self._jpg_lock:
@@ -342,120 +250,16 @@ class LaptopFaceBridge:
                         self.frames_count += 1
                         self._jpg_lock.notify_all()
                     retry_delay = 0.2
-            except IncompleteJpegPart:
-                retry_delay = 0.2
-            except Exception as exc:
+            except OSError as exc:
                 if not self._stop.is_set():
                     print(f"[LAPTOP-AI] Stream reconnecting ({exc})...", file=sys.stderr)
             finally:
                 with self._jpg_lock:
                     self._latest_jpg = None
                     self._stream_generation += 1
-                    if self.uart_mode:
-                        self.client.observe({}, time.monotonic())
+                    self.hub.observe({}, time.monotonic())
                     self._jpg_lock.notify_all()
             self._stop.wait(retry_delay)
-
-    def _status_sync_loop(self):
-        """Periodically sync enrolled names and ESP-CAM commands in the background."""
-        while not self._stop.is_set():
-            try:
-                status = self.client.get_status()
-                self.last_status = status
-
-                # Sync enrolled list with ESP32 Web UI
-                enrolled_list = [
-                    {"id": i, "name": name}
-                    for i, name in enumerate(self.engine.known_names)
-                ]
-                self.client.sync_enrolled(enrolled_list)
-
-                # Handle remote dashboard delete/clear commands
-                if status.get("pendingAction") == "delete":
-                    seq = int(status.get("pendingActionSeq", 0))
-                    del_id = int(status.get("pendingDeleteId", -1))
-                    if 0 <= del_id < len(self.engine.known_names):
-                        del_name = self.engine.known_names[del_id]
-                        fpath = os.path.join(self.engine.faces_dir, f"{del_name.replace(' ', '_')}.jpg")
-                        if os.path.isfile(fpath):
-                            os.remove(fpath)
-                        self.engine.load_known_faces()
-                    self.client.ack_command(seq)
-                elif status.get("pendingAction") == "clear":
-                    seq = int(status.get("pendingActionSeq", 0))
-                    for fname in os.listdir(self.engine.faces_dir):
-                        p = os.path.join(self.engine.faces_dir, fname)
-                        if os.path.isfile(p):
-                            os.remove(p)
-                    self.engine.load_known_faces()
-                    self.client.ack_command(seq)
-
-            except Exception:
-                pass
-            time.sleep(1.5)
-
-    def step_once(self) -> Optional[dict]:
-        """Analyze the latest frame once and return the camera response.
-
-        This synchronous entry point is useful for integration tests and for
-        headless callers. The production loop below uses the same feedback API
-        and keeps its reconnecting reader thread.
-        """
-        with self._jpg_lock:
-            jpg_bytes = self._latest_jpg
-            frame_at = self._latest_frame_at
-            generation = self._stream_generation
-        if jpg_bytes is None:
-            return None
-
-        if self.uart_mode:
-            frame = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is not None:
-                self._observe_uart_result(self.engine.analyze_frame(frame), frame_at, generation)
-            return None
-
-        # Keep the synchronous path equivalent to the background sync thread.
-        # This also makes dashboard commands deterministic in integration tests.
-        try:
-            self.last_status = self.client.get_status()
-        except Exception:
-            pass
-
-        if callable(self.engine) and not hasattr(self.engine, "analyze_frame"):
-            verdict = self.engine(jpg_bytes, self.last_status)
-        else:
-            arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is None:
-                return None
-            verdict = self.engine.analyze_frame(frame)
-
-        if verdict.get("enrollCaptured") and self.last_status.get("enrollPending"):
-            target_name = str(self.last_status.get("enrollTargetName") or "User")
-            enrolled = self.last_status.get("enrolled") or []
-            new_id = max((int(item.get("id", -1)) for item in enrolled), default=-1) + 1
-            return self.client.ack_enroll(True, new_id, target_name, "Enrolled via Laptop AI")
-
-        pending_action = self.last_status.get("pendingAction")
-        if pending_action in ("delete", "clear"):
-            self.client.ack_command(int(self.last_status.get("pendingActionSeq", 0)))
-            self.last_status = self.client.get_status()
-
-        result = verdict.get("result", "no_face")
-        response = self.client.send_result(
-            result=result,
-            match_id=verdict.get("matchId", -1),
-            name=verdict.get("name", "---"),
-            confidence=verdict.get("confidence", 0.0),
-            face_detected=verdict.get("faceDetected", False),
-            face_quality=verdict.get("faceQuality", "NO_FACE"),
-            box=verdict.get("box", [0, 0, 0, 0]),
-            inference_ms=verdict.get("inferenceMs", 0),
-            laptop_model=self.laptop_model,
-        )
-        self.last_feedback_time = time.time()
-        self.last_result_sent = result
-        return response
 
     def draw_hud(self, bgr_img: Optional[np.ndarray], verdict: dict, fps: float,
                  size: Tuple[int, int] = (960, 720)) -> np.ndarray:
@@ -541,12 +345,9 @@ class LaptopFaceBridge:
     def run(self):
         print("\n" + "=" * 70)
         print(f" [SMART HOME] Laptop Face Recognition AI Online")
-        print(f" - Camera Stream: {self.client.stream_url}")
-        if self.uart_mode:
-            print(f" - Feedback API: {self.client.feedback_url}")
-            print(f" - Dashboard preview port: {self.client.preview_port}")
-        else:
-            print(f" - Feedback API: {self.client.base_url}/api/recognition/result")
+        print(f" - Camera Stream: {self.client.description}")
+        print(f" - Feedback API: {self.hub.feedback_url}")
+        print(f" - Dashboard preview port: {self.hub.preview_port}")
         print(f" - Enrolled Faces: {len(self.engine.known_names)} loaded from {self.engine.faces_dir}")
         print(f" - Hotkeys: Press 'e' in preview window to enroll, 'q' to quit")
         print("=" * 70 + "\n")
@@ -586,20 +387,13 @@ class LaptopFaceBridge:
         preview_worker = None
         workers = []
         try:
-            if self.uart_mode:
-                if __package__:
-                    from .laptop_uart import make_preview_server
-                else:
-                    from laptop_uart import make_preview_server
-                preview_server = make_preview_server(self.client.preview_bind, self.client.preview_port,
-                                                     self._preview_frame)
-                self.client.preview_port = preview_server.server_port
-                preview_worker = threading.Thread(target=preview_server.serve_forever, daemon=True)
-                workers.append(preview_worker)
-                workers.append(threading.Thread(target=self.client.run_feedback,
-                                                args=(self._stream_state, self._stop), daemon=True))
-            else:
-                workers.append(threading.Thread(target=self._status_sync_loop, daemon=True))
+            preview_server = make_preview_server(self.hub.preview_bind, self.hub.preview_port,
+                                                 self._preview_frame)
+            self.hub.preview_port = preview_server.server_port
+            preview_worker = threading.Thread(target=preview_server.serve_forever, daemon=True)
+            workers.append(preview_worker)
+            workers.append(threading.Thread(target=self.hub.run_feedback,
+                                            args=(self._stream_state, self._stop), daemon=True))
             workers.append(threading.Thread(target=self._stream_reader_loop, daemon=True))
             for worker in workers:
                 worker.start()
@@ -637,49 +431,7 @@ class LaptopFaceBridge:
                     fps_frame_counter = 0
                     fps_timer = now
 
-                # Dispatch result back to ESP32-CAM (throttled to avoid HTTP flooding)
-                result_str = verdict.get("result", "no_face")
-                should_send = (
-                    (result_str in ("recognized", "unknown") and (now - self.last_feedback_time >= self.feedback_interval_s)) or
-                    (result_str != self.last_result_sent and result_str != "no_face") or
-                    (now - self.last_feedback_time >= 2.0)
-                )
-
-                if self.uart_mode:
-                    self._observe_uart_result(verdict, frame_at, generation)
-                elif should_send:
-                    try:
-                        response = self.client.send_result(
-                            result=result_str,
-                            match_id=verdict.get("matchId", -1),
-                            name=verdict.get("name", "---"),
-                            confidence=verdict.get("confidence", 0.0),
-                            face_detected=verdict.get("faceDetected", False),
-                            face_quality=verdict.get("faceQuality", "NO_FACE"),
-                            box=verdict.get("box", [0, 0, 0, 0]),
-                            inference_ms=verdict.get("inferenceMs", 0),
-                            laptop_model=self.laptop_model,
-                        )
-                        if response.get("hubDispatched"):
-                            print(f"[AI-MATCH] Sent {response.get('hubAction')} to the hub")
-                        elif result_str != self.last_result_sent and result_str in ("recognized", "unknown"):
-                            print(f"[AI-MATCH] {result_str.upper()}: {verdict.get('name', 'Unknown')}")
-                        self.last_result_sent = result_str
-                    except (OSError, ValueError) as exc:
-                        print(f"[LAPTOP-AI] Camera feedback failed: {exc}", file=sys.stderr)
-                    finally:
-                        self.last_feedback_time = now
-
-                # Check if dashboard triggered an enrollment
-                if self.last_status.get("enrollPending") and verdict.get("faceDetected"):
-                    box = verdict.get("box", [0, 0, 0, 0])
-                    target_name = str(self.last_status.get("enrollTargetName") or "User")
-                    if self.engine.enroll(current_bgr, box, target_name):
-                        new_id = len(self.engine.known_names) - 1
-                        try:
-                            self.client.ack_enroll(True, new_id, target_name, "Enrolled via Laptop AI")
-                        except Exception:
-                            pass
+                self._observe_result(verdict, frame_at, generation)
 
                 # Display live GUI
                 if self.show_gui:
@@ -724,51 +476,30 @@ class LaptopFaceBridge:
 
 def main():
     parser = argparse.ArgumentParser(description="High-Speed Laptop Face Recognition Bridge for ESP32-CAM")
-    parser.add_argument("--standalone", action="store_true",
-                        help="Use the camera hotspot at 192.168.11.1 and keep results local")
-    parser.add_argument("--uart-port", help="Serial camera port, such as COM5 or /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=2_000_000, help="Camera UART baud rate")
-    parser.add_argument("--hub", default="192.168.4.1", help="Hub address for UART mode")
-    parser.add_argument("--preview-bind", default="0.0.0.0", help="Laptop interface address for the UART preview")
-    parser.add_argument("--preview-port", type=int, default=8080, help="Laptop HTTP port for the UART preview")
-    parser.add_argument("--ip", help="Override the camera IP (hub mode defaults to 192.168.4.101)")
-    parser.add_argument("--http-port", type=int, default=80, help="ESP32-CAM HTTP control port (default: 80)")
-    parser.add_argument("--stream-port", type=int, default=81, help="ESP32-CAM MJPEG stream port (default: 81)")
-    parser.add_argument("--resolution", choices=RESOLUTIONS, help="Set the camera resolution before streaming")
-    parser.add_argument("--jpeg-quality", type=int,
+    parser.add_argument("--uart-port", required=True, help="CH340 port, such as COM5 or /dev/ttyUSB0")
+    parser.add_argument("--baud", type=int, default=UART_BAUD, help="Camera UART baud rate")
+    parser.add_argument("--hub", default="192.168.4.1", help="Hub address for dashboard preview and feedback")
+    parser.add_argument("--preview-bind", default="0.0.0.0", help="Laptop interface for the dashboard preview")
+    parser.add_argument("--preview-port", type=int, default=8080, help="Laptop HTTP port for the dashboard preview")
+    parser.add_argument("--resolution", choices=RESOLUTIONS, default="qvga", help="Set the camera resolution before streaming")
+    parser.add_argument("--jpeg-quality", type=int, default=16,
                         help="Set JPEG compression. Higher numbers send smaller frames")
     parser.add_argument("--faces-dir", default=os.path.join(os.path.dirname(__file__), "known_faces"),
                         help="Directory containing <Name>.jpg photos of authorized persons")
     parser.add_argument("--thresh", type=float, default=0.58,
                         help="Euclidean face distance threshold (default: 0.58, lower=stricter)")
     parser.add_argument("--no-gui", action="store_true", help="Run in headless background mode without OpenCV window")
+    add_light_argument(parser)
     args = parser.parse_args()
-    uart_mode = args.uart_port is not None
-    min_quality, max_quality = (10, 63) if uart_mode else (8, 30)
-    if args.jpeg_quality is not None and not min_quality <= args.jpeg_quality <= max_quality:
-        parser.error(f"--jpeg-quality must be between {min_quality} and {max_quality}")
-    if uart_mode:
-        if args.standalone or args.ip:
-            parser.error("--uart-port uses --hub for Wi-Fi feedback")
-        if args.baud <= 0 or not 1 <= args.preview_port <= 65535:
-            parser.error("--baud must be positive and --preview-port must be 1–65535")
-        try:
-            if __package__:
-                from .laptop_uart import UartFaceClient
-            else:
-                from laptop_uart import UartFaceClient
-        except ImportError as exc:
-            parser.exit(1, f"UART camera setup failed ({exc}). Install pyserial in this Python environment.\n")
-        client = UartFaceClient(args.uart_port, args.baud, args.resolution or "qvga",
-                                args.jpeg_quality or 16, args.hub, args.preview_bind, args.preview_port)
-    else:
-        client = EspCamStreamClient(args.ip, args.http_port, args.stream_port, standalone=args.standalone)
-        try:
-            client.configure_video(args.resolution, args.jpeg_quality)
-        except (OSError, ValueError) as exc:
-            parser.exit(1, f"Camera configuration failed: {exc}\n")
+    validate_light(parser, args.light)
+    if not 10 <= args.jpeg_quality <= 63:
+        parser.error("--jpeg-quality must be between 10 and 63")
+    if not 1 <= args.preview_port <= 65535 or args.baud <= 0:
+        parser.error("--preview-port must be 1–65535 and --baud must be positive")
+    client = SerialCamera(args.uart_port, args.baud, args.resolution, args.jpeg_quality, args.light)
+    hub = LaptopHubClient(args.hub, args.preview_bind, args.preview_port)
     engine = FastFaceEngine(args.faces_dir, distance_thresh=args.thresh)
-    bridge = LaptopFaceBridge(client, engine, show_gui=not args.no_gui, uart_mode=uart_mode)
+    bridge = LaptopFaceBridge(client, engine, hub, show_gui=not args.no_gui)
     try:
         bridge.run()
     except OSError as exc:

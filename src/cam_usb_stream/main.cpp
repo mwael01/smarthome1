@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
 #include <stddef.h>
 #include <esp_log.h>
 #include <esp_rom_crc.h>
@@ -13,6 +14,7 @@
 namespace {
 constexpr size_t kMaxJpegSize = 128 * 1024;
 constexpr int kDefaultQuality = 16;
+constexpr uint32_t kLightTimeoutMs = 4000;
 constexpr uint8_t kFrameMagic[] = {0xff, 0xff, 0x00, 'U', 'S', 'B', 'C', '1'};
 
 // All numeric fields are little-endian on the ESP32-S3.
@@ -54,6 +56,31 @@ int activeQuality = kDefaultQuality;
 uint8_t framesToDiscard = 0;
 uint32_t sequence = 0;
 bool streaming = false;
+Adafruit_NeoPixel light(1, -1, NEO_GRB + NEO_KHZ800);
+int activeWhite = -1;
+uint32_t lightCommandAtMs = 0;
+
+void setWhite(int pin, uint8_t level) {
+  if (light.getPin() != pin) {
+    if (light.getPin() >= 0) {
+      light.clear();
+      light.show();
+    }
+    light.setPin(pin);
+    activeWhite = -1;
+    if (pin >= 0) light.begin();
+  }
+  if (pin >= 0 && activeWhite != level) {
+    light.setPixelColor(0, level, level, level);
+    light.show();
+    activeWhite = level;
+  }
+}
+
+void stopStreaming() {
+  streaming = false;
+  setWhite(-1, 0);
+}
 
 bool linkConnected() {
 #if defined(CAMERA_USB_UART)
@@ -98,16 +125,28 @@ bool sendPacket(size_t size) {
 
 void applyCommand(const char *command) {
   if (strcmp(command, "STOP") == 0) {
-    streaming = false;
+    stopStreaming();
     return;
   }
 
   char name[8];
+  char pinName[8];
   int quality;
+  int white = 0;
   char extra;
-  if (sscanf(command, "START %7s %2d %c", name, &quality, &extra) != 2 ||
+  int fields = sscanf(command, "START %7s %2d %7s %3d %c",
+                      name, &quality, pinName, &white, &extra);
+  if ((fields != 2 && fields != 4) ||
       quality < 10 || quality > 63) {
     return;
+  }
+  int pin = -1;
+  if (fields == 4) {
+    if ((strcmp(pinName, "38") != 0 && strcmp(pinName, "48") != 0) ||
+        white < 0 || white > 255) {
+      return;
+    }
+    pin = atoi(pinName);
   }
   for (const Preset &preset : kPresets) {
     if (strcmp(name, preset.name) != 0) {
@@ -128,6 +167,8 @@ void applyCommand(const char *command) {
       activeQuality = quality;
       framesToDiscard = 2;
     }
+    setWhite(pin, white);
+    lightCommandAtMs = millis();
     streaming = true;
     return;
   }
@@ -173,20 +214,12 @@ void setup() {
   }
 #endif
 
-  if (!psramFound()) {
-    Serial.println("[USB CAM] PSRAM is required");
-    return;
-  }
-  if (!camHwInitCamera(PIXFORMAT_JPEG, activePreset->size, activeQuality, false, false)) {
-    return;
-  }
-  if (!camHwCaptureProfile().sensorJpeg) {
-    Serial.println("[USB CAM] This test requires a sensor that outputs JPEG");
+  if (!camHwInitCamera(activePreset->size, activeQuality)) {
     return;
   }
   packet = static_cast<uint8_t *>(ps_malloc(sizeof(FrameHeader) + kMaxJpegSize));
   if (!packet) {
-    Serial.println("[USB CAM] Could not allocate USB packet buffer");
+    Serial.println("[SERIAL CAM] Could not allocate a frame buffer");
   }
 #if defined(CAMERA_USB_UART)
   // UART0 also carries boot diagnostics. Keep logs out of the binary stream.
@@ -196,11 +229,14 @@ void setup() {
 
 void loop() {
   if (!packet || !linkConnected()) {
-    streaming = false;
+    stopStreaming();
     delay(5);
     return;
   }
   readCommands();
+  if (activeWhite > 0 && millis() - lightCommandAtMs >= kLightTimeoutMs) {
+    setWhite(-1, 0);
+  }
   if (!streaming) {
     delay(5);
     return;
@@ -242,6 +278,9 @@ void loop() {
       esp_rom_crc32_le(0, reinterpret_cast<const uint8_t *>(&header), offsetof(FrameHeader, crc));
   header.crc = esp_rom_crc32_le(headerCrc, jpeg, size);
   memcpy(packet, &header, sizeof(header));
-  sendPacket(sizeof(header) + size);
+  if (!sendPacket(sizeof(header) + size)) {
+    // The receiver retries START after a gap and resynchronizes on the next packet.
+    stopStreaming();
+  }
   delay(1);
 }
