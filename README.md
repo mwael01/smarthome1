@@ -30,7 +30,7 @@ A multi-node ESP32 smart home safety and biometric access-control system built w
    - Captures JPEG frames on the ESP32-S3 and serves a low-latency MJPEG stream on port 81.
    - Face detection and recognition run on the laptop. Recognition verdicts return to the camera and Main Hub over HTTP and ESP-NOW.
    - A recognized face unlocks Door Servo 3. An unknown face starts the intruder siren.
-   - PSRAM triple buffering, Wi-Fi power-save disabled, and maximum transmit power keep the camera focused on transmission.
+   - Two PSRAM frame buffers with latest-frame capture, Wi-Fi power-save disabled, and high transmit power support live JPEG streaming.
 
 ---
 
@@ -71,6 +71,8 @@ A multi-node ESP32 smart home safety and biometric access-control system built w
 | **MFRC522 RFID Reader** | `SDA` / `SS`<br>`SCK`<br>`MOSI`<br>`MISO`<br>`RST` | `GPIO5`<br>`GPIO14`<br>`GPIO13`<br>`GPIO12`<br>`GPIO22` | Hardware SPI (`MFRC522`) | Reads 13.56 MHz RFID tags; accepted UID: `52411902` |
 
 ### ESP32-S3 camera power and flash
+
+The camera targets are configured for the **ESP32-S3-CAM N16R8** with 16 MB of quad flash at 80 MHz and 8 MB of octal PSRAM. The app and settings keep the existing partition layout. Use the CH340 USB-to-UART programmer for the board sold with that adapter. [Espressif memory settings](https://docs.espressif.com/projects/arduino-esp32/en/latest/troubleshooting.html)
 
 The camera firmware uses the ESP32-S3-EYE camera pinout. If you have a different ESP32-S3 camera board, verify its schematic before wiring or flashing. On the Espressif ESP32-S3-EYE, use the onboard USB port for power and flashing.
 
@@ -120,13 +122,15 @@ python3 tools/laptop_face_bridge.py --standalone --resolution qvga --jpeg-qualit
 
 QVGA is 320×240. Use `hvga` (480×320) or `vga` (640×480) if the recognition model needs more detail. Higher JPEG quality numbers send smaller images. The camera saves explicit settings and uses QVGA on a fresh configuration. Press **E** in the laptop preview to enroll a face.
 
+The N16R8 profile uses sensor JPEG over HTTP MJPEG, 20 MHz camera XCLK, and two PSRAM frame buffers with latest-frame capture when the sensor supports JPEG. This follows Espressif's streaming example. The module's memory marking does not identify the sensor. On port 80, `/api/status` reports `sensorPid`, `captureMode`, `frameBuffers`, `flashBytes`, and `psramBytes`. Look for `sensor_jpeg`, two buffers, and 8 MiB of PSRAM on a JPEG-capable N16R8 build. [Espressif CameraWebServer example](https://github.com/espressif/arduino-esp32/blob/2.0.17/libraries/ESP32/examples/Camera/CameraWebServer/CameraWebServer.ino)
+
 For a raw receiver test, close other viewers and run the following command. Use `192.168.4.101` for the integrated mode.
 
 ```bash
-python3 tools/test_camera_stream.py --url http://192.168.11.1:81/stream --frames 300 --resolution qvga
+python3 tools/test_camera_stream.py --url http://192.168.11.1:81/stream --frames 300 --resolution qvga --jpeg-quality 16
 ```
 
-Compare received FPS and the longest gap between frames at each resolution. Repeat with the hub preview or laptop AI running to measure the extra load.
+Compare received FPS and the longest gap between frames at each resolution. Repeat with the hub preview or laptop AI running to measure the extra load. Compare those results with `fps` (valid camera captures) and `publishFps` (frames made available to viewers) in `/api/status`.
 
 For hardware with a verified GPIO3 flashlight, use `cam_face_stream_s3_standalone_gpio3` or `cam_face_stream_s3_gpio3`. The flashlight controls remain available through a POST to `/api/config?flash_auto=0&flash=25` on port 80. Set `flash=0` to turn it off. [Nulllab board layout and pinout](https://github.com/nulllaborg/esp32s3-cam#hardware)
 

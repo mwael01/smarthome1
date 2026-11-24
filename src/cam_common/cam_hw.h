@@ -55,6 +55,14 @@ bool camHwFlashAvailable();
 void camHwSetStatusLed(bool on);
 void camHwSetFlashLed(uint8_t duty);
 
+struct CamCaptureProfile {
+  uint16_t sensorPid = 0;
+  uint8_t frameBuffers = 0;
+  bool sensorJpeg = false;
+};
+
+CamCaptureProfile camHwCaptureProfile();
+
 bool camHwInitCamera(pixformat_t pixelFormat,
                      framesize_t frameSize,
                      int jpegQuality,

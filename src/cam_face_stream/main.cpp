@@ -85,7 +85,9 @@ struct StreamStatusSnapshot {
   float lastSimilarity = 0.0f;
   uint32_t inferenceMs = 0;
   float fps = 0.0f;
+  float publishFps = 0.0f;
   uint32_t frameCount = 0;
+  unsigned long fpsUpdatedMs = 0;
   float sceneLuma = 0.0f;
   uint8_t flashDutyApplied = 0;
   uint32_t feedbackCount = 0;
@@ -108,8 +110,6 @@ char g_enrollName[24] = "User";
 volatile bool g_faceDetectedLive = false;
 volatile unsigned long g_lastFaceSeenMs = 0;
 volatile unsigned long g_lastLaptopFeedbackMs = 0;
-volatile float g_streamFps = 0.0f;
-volatile uint32_t g_capturedFrames = 0;
 
 int g_unknownStreak = 0;
 unsigned long g_lastRecognizedSentMs = 0;
@@ -382,7 +382,9 @@ void camCaptureTask(void * /*param*/) {
   unsigned long lastMotionMs = 0;
   unsigned long lastActivityMs = 0;
   unsigned long flashSettleUntilMs = 0;
-  uint32_t streamFrames = 0;
+  uint32_t capturedFrames = 0;
+  uint32_t capturesAtLastSample = 0;
+  uint32_t publishedAtLastSample = camHwGetPreviewFrameSeq();
   unsigned int framesToDiscard = 0;
   float sceneLuma = 0.35f;
   bool motionRecent = false;
@@ -569,23 +571,25 @@ void camCaptureTask(void * /*param*/) {
       }
     }
 
-    g_capturedFrames++;
-    streamFrames++;
+    ++capturedFrames;
     if (now - streamFpsLastMs >= 1000) {
-      g_streamFps = (streamFrames * 1000.0f) / (now - streamFpsLastMs);
-      streamFrames = 0;
-      streamFpsLastMs = now;
-
       if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        const float scale = 1000.0f / (now - streamFpsLastMs);
+        const uint32_t published = camHwGetPreviewFrameSeq();
         g_status.cameraReady = true;
-        g_status.fps = g_streamFps;
-        g_status.frameCount = g_capturedFrames;
+        g_status.fps = (capturedFrames - capturesAtLastSample) * scale;
+        g_status.publishFps = (published - publishedAtLastSample) * scale;
+        g_status.frameCount = capturedFrames;
+        g_status.fpsUpdatedMs = now;
         g_status.sceneLuma = sceneLuma;
         g_status.motionDetected = motionRecent;
         g_status.flashDutyApplied = currentDuty;
         g_status.frameWidth = fbW;
         g_status.frameHeight = fbH;
         xSemaphoreGive(stateMutex);
+        capturesAtLastSample = capturedFrames;
+        publishedAtLastSample = published;
+        streamFpsLastMs = now;
       }
     }
 
@@ -1030,8 +1034,18 @@ void handleStatus() {
   json += "\"lastMatchId\":" + String(snap.lastMatchId) + ",";
   json += "\"lastSimilarity\":" + String(snap.lastSimilarity, 3) + ",";
   json += "\"inferenceMs\":" + String(snap.inferenceMs) + ",";
-  json += "\"fps\":" + String(snap.fps, 1) + ",";
+  const bool freshFps = millis() - snap.fpsUpdatedMs < 2500;
+  const auto capture = camHwCaptureProfile();
+  const char *captureMode = capture.frameBuffers == 0 ? "unavailable" :
+                            (capture.sensorJpeg ? "sensor_jpeg" : "software_jpeg");
+  json += "\"fps\":" + String(freshFps ? snap.fps : 0.0f, 1) + ",";
+  json += "\"publishFps\":" + String(freshFps ? snap.publishFps : 0.0f, 1) + ",";
   json += "\"frameCount\":" + String(snap.frameCount) + ",";
+  json += "\"captureMode\":\"" + String(captureMode) + "\",";
+  json += "\"sensorPid\":" + String(capture.sensorPid) + ",";
+  json += "\"frameBuffers\":" + String(capture.frameBuffers) + ",";
+  json += "\"flashBytes\":" + String(ESP.getFlashChipSize()) + ",";
+  json += "\"psramBytes\":" + String(ESP.getPsramSize()) + ",";
   json += "\"sceneLuma\":" + String(snap.sceneLuma, 3) + ",";
   json += "\"flashDutyApplied\":" + String(snap.flashDutyApplied) + ",";
   json += "\"enrolledCount\":" + String(snap.enrolledCount) + ",";

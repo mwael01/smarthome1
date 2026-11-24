@@ -24,23 +24,25 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import multiprocessing
+import queue
 import re
 import statistics
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 # Keep the direct script entry point usable from the face demo directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from camera_stream import IncompleteJpegPart, iter_jpegs
+from camera_stream import IncompleteJpegPart, RESOLUTIONS, iter_jpegs, set_video_config
 
 try:
     import cv2
-    import dlib
     import face_recognition
     import numpy as np
 except ImportError as exc:  # friendly message for a not-yet-set-up environment
@@ -54,6 +56,8 @@ except ImportError as exc:  # friendly message for a not-yet-set-up environment
 KNOWN_FACES_DIR = Path(__file__).resolve().parent / "known_faces"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 CAMERA_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+PREVIEW_SIZE = (960, 720)
+FRAME_MAX_AGE = 1.5
 # <identity>-<number>.<jpg|jpeg|png>  — greedy so a hyphenated name still works
 _IDENTITY_RE = re.compile(r"^(?P<name>.+)-\d+\.(?:jpe?g|png)$", re.IGNORECASE)
 _SUPPORTED = ("*.jpg", "*.jpeg", "*.png")
@@ -99,9 +103,7 @@ def recognize(frame_bgr, known: dict[str, list], tolerance: float) -> list[tuple
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     locations = face_recognition.face_locations(frame_rgb, number_of_times_to_upsample=1)
     if not locations:
-        detector = dlib.get_frontal_face_detector()
-        rects = detector(frame_rgb, 0)
-        locations = [(r.top(), r.right(), r.bottom(), r.left()) for r in rects]
+        locations = face_recognition.face_locations(frame_rgb, number_of_times_to_upsample=0)
 
     if not locations:
         return []
@@ -140,14 +142,15 @@ def annotate(frame_bgr, results: list[tuple]) -> None:
         display_name = name.replace("-", " ").title() if is_known else "Unknown"
         if is_known and distance is not None:
             conf_pct = int(max(0.0, min(1.0, 1.0 - (distance / 0.6) * 0.5)) * 100)
-            label = f"{display_name} ({conf_pct}%) [UNLOCK]"
+            label = f"{display_name} ({conf_pct}%)"
         else:
-            label = "Unknown Intruder"
+            label = "Unknown face"
 
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-        tag_y = max(top - 8, th + 36)
-        cv2.rectangle(frame_bgr, (left, tag_y - th - 5), (left + tw + 8, tag_y + 3), color, -1)
-        cv2.putText(frame_bgr, label, (left + 4, tag_y - 2),
+        tag_x = max(0, min(left, frame_bgr.shape[1] - tw - 8))
+        tag_y = max(top - 8, th + 6)
+        cv2.rectangle(frame_bgr, (tag_x, tag_y - th - 5), (tag_x + tw + 8, tag_y + 3), color, -1)
+        cv2.putText(frame_bgr, label, (tag_x + 4, tag_y - 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0) if is_known else (255, 255, 255), 1, cv2.LINE_AA)
 
 
@@ -223,24 +226,32 @@ def run_camera(known: dict[str, list], tolerance: float) -> None:
     cv2.destroyAllWindows()
 
 
+@dataclass(eq=False)
+class CameraFrame:
+    image: np.ndarray
+    received_at: float
+    connection: int
+
+
 class EspStreamReader:
     """Non-blocking background thread that constantly reads the latest JPEG from the ESP32 MJPEG stream."""
 
     def __init__(self, stream_url: str):
         self.stream_url = stream_url
-        self.latest_frame: np.ndarray | None = None
-        self.latest_frame_at = 0.0
+        self.latest_frame: CameraFrame | None = None
+        self.frame_count = 0
         self.lock = threading.Lock()
         self.stopped = threading.Event()
-        self.connected = False
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
     def _worker(self):
+        connection = 0
         while not self.stopped.is_set():
             retry_delay = 1.0
             try:
                 with CAMERA_HTTP.open(self.stream_url, timeout=4.0) as response:
+                    connection += 1
                     for jpeg in iter_jpegs(response, skip_damaged=True):
                         if self.stopped.is_set():
                             break
@@ -250,9 +261,8 @@ class EspStreamReader:
                             continue
                         if frame is not None:
                             with self.lock:
-                                self.latest_frame = frame
-                                self.latest_frame_at = time.monotonic()
-                                self.connected = True
+                                self.latest_frame = CameraFrame(frame, time.monotonic(), connection)
+                                self.frame_count += 1
                             retry_delay = 0.2
             except IncompleteJpegPart:
                 retry_delay = 0.2
@@ -262,14 +272,14 @@ class EspStreamReader:
             finally:
                 with self.lock:
                     self.latest_frame = None
-                    self.connected = False
             self.stopped.wait(retry_delay)
 
-    def get_frame(self) -> np.ndarray | None:
+    def snapshot(self) -> tuple[CameraFrame | None, int]:
         with self.lock:
-            if time.monotonic() - self.latest_frame_at <= 1.5:
-                return self.latest_frame
-            return None
+            frame = self.latest_frame
+            if frame is not None and time.monotonic() - frame.received_at > FRAME_MAX_AGE:
+                frame = None
+            return frame, self.frame_count
 
     def stop(self):
         self.stopped.set()
@@ -348,6 +358,102 @@ def enroll_new_identity(frame_bgr: np.ndarray, box: tuple | list, name: str) -> 
     return False
 
 
+def sync_enrolled(base_url, known):
+    enrolled = [{"id": idx, "name": name.replace("-", " ").title()} for idx, name in enumerate(known)]
+    request = urllib.request.Request(
+        f"{base_url}/api/laptop/enrolled",
+        data=json.dumps({"enrolled": enrolled}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with CAMERA_HTTP.open(request, timeout=1.5):
+            pass
+    except OSError:
+        pass
+
+
+def analyze_stream_frames(requests, replies, known, tolerance):
+    """Run dlib outside the GUI process, even when its routines hold the GIL."""
+    cv2.setNumThreads(1)
+    while True:
+        request = requests.get()
+        if request is None:
+            return
+        image, updated_known = request
+        if updated_known is not None:
+            known = updated_known
+        started = time.perf_counter()
+        results = recognize(image, known, tolerance)
+        replies.put((results, round((time.perf_counter() - started) * 1000)))
+
+
+def draw_preview(size, sample, results, received_fps, preview_fps, inference_ms):
+    width, height = size
+    canvas = np.full((height, width, 3), (27, 23, 20), dtype=np.uint8)
+    header = min(55, height // 4)
+    footer = min(60, height // 4)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_color = (233, 228, 224)
+    muted = (185, 177, 169)
+    cv2.line(canvas, (0, header - 1), (width, header - 1), (58, 50, 43))
+    cv2.line(canvas, (0, height - footer), (width, height - footer), (58, 50, 43))
+    if width >= 180 and header >= 24:
+        status_color = (148, 224, 84) if sample is not None else (64, 179, 249)
+        cv2.circle(canvas, (22, header // 2), 4, status_color, -1, cv2.LINE_AA)
+        title = "Camera preview" if sample is not None else ("Waiting for camera" if width >= 240 else "Waiting")
+        cv2.putText(canvas, title, (36, header // 2 + 6), font, 0.6, text_color, 1, cv2.LINE_AA)
+    if sample is not None:
+        image = sample.image
+        source_h, source_w = image.shape[:2]
+        scale = min(width / source_w, (height - header - footer) / source_h)
+        video_w, video_h = max(1, round(source_w * scale)), max(1, round(source_h * scale))
+        left = (width - video_w) // 2
+        top = header + (height - header - footer - video_h) // 2
+        video = canvas[top:top + video_h, left:left + video_w]
+        interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+        cv2.resize(image, (video_w, video_h), dst=video, interpolation=interpolation)
+        scaled_results = [
+            (round(y1 * video_h / source_h), round(x2 * video_w / source_w),
+             round(y2 * video_h / source_h), round(x1 * video_w / source_w), name, distance)
+            for y1, x2, y2, x1, name, distance in results
+        ]
+        annotate(video, scaled_results)
+        info = f"{source_w}x{source_h}  |  RX {received_fps:.1f} fps  |  Preview {preview_fps:.1f} fps"
+        if width >= 530 and inference_ms is not None:
+            info += f"  |  AI {inference_ms} ms"
+        if footer >= 24 and width >= 180:
+            (text_width, _), _ = cv2.getTextSize(info, font, 0.51, 1)
+            cv2.putText(canvas, info, (16, height - footer + 19), font,
+                        0.51 * min(1, (width - 32) / text_width), text_color, 1, cv2.LINE_AA)
+    if footer >= 48 and width >= 320:
+        cv2.putText(canvas, "Space  Save frame     E  Enroll     Q  Quit",
+                    (16, height - 13), font, 0.44, muted, 1, cv2.LINE_AA)
+    return canvas
+
+
+def queue_feedback(pool, base_url, results, inference_ms, previous):
+    """Send a fresh verdict without making a busy HTTP request block the preview."""
+    future, last_verdict, last_sent = previous
+    if future is not None and not future.done():
+        return previous
+    now = time.monotonic()
+    if results:
+        match = next((face for face in results if face[4] != "Unknown"), results[0])
+        top, right, bottom, left, name, distance = match
+        verdict = "unknown" if name == "Unknown" else "recognized"
+        interval = 0.4 if verdict == "unknown" else 0.35
+        if verdict != last_verdict or now - last_sent >= interval:
+            future = pool.submit(send_esp_feedback, base_url, verdict, name,
+                                 distance if verdict == "recognized" else None,
+                                 [int(left), int(top), int(right), int(bottom)], inference_ms)
+            return future, verdict, now
+    elif now - last_sent >= 2.5:
+        future = pool.submit(send_esp_feedback, base_url, "no_face", "---", None)
+        return future, "no_face", now
+    return previous
+
+
 def run_esp(
     cam_ip: str,
     http_port: int,
@@ -368,141 +474,102 @@ def run_esp(
     print(f" - Controls:       SPACE = save snapshot, E = enroll face, Q = quit")
     print("=" * 70 + "\n")
 
-    # Initial sync with ESP32-CAM enrolled list
-    try:
-        enrolled_sync = [
-            {"id": i, "name": name.replace("-", " ").title()}
-            for i, name in enumerate(known.keys())
-        ]
-        sync_data = json.dumps({"enrolled": enrolled_sync}).encode("utf-8")
-        sync_req = urllib.request.Request(
-            f"{base_url}/api/laptop/enrolled",
-            data=sync_data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with CAMERA_HTTP.open(sync_req, timeout=1.5) as resp:
-            pass
-    except Exception:
-        pass
-
     reader = EspStreamReader(stream_url)
-    window_name = "Smart Home Security — ESP32 Face Recognition"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 800, 600)
+    window = "Smart Home Security - ESP32 Face Recognition"
+    cv2.setNumThreads(1)
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+    cv2.resizeWindow(window, *PREVIEW_SIZE)
+    cv2.imshow(window, draw_preview(PREVIEW_SIZE, None, [], 0, 0, None))
 
-    results: list[tuple] = []
-    detect_every = 2
-    frame_i = 0
-    fps_frames = 0
-    last_frame = None
-    infer_ms = 0
-    fps_timer = time.time()
-    fps = 0.0
-    last_feedback_time = 0.0
-    last_verdict_sent = "NONE"
+    context = multiprocessing.get_context("spawn")
+    requests, replies = context.Queue(maxsize=1), context.Queue(maxsize=1)
+    worker = context.Process(target=analyze_stream_frames, args=(requests, replies, known, tolerance))
+    feedback_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera-feedback")
+    feedback = (feedback_pool.submit(sync_enrolled, base_url, known), "none", 0.0)
+    worker_known = known
+    pending = None
+    last_analyzed = None
+    analysis = None
+    last_render = None
+    size = PREVIEW_SIZE
+    measured_at = time.monotonic()
+    received_fps = preview_fps = 0.0
+    received_before = displayed = displayed_before = 0
 
     try:
+        worker.start()
         while True:
-            frame = reader.get_frame()
-            if frame is None:
-                last_frame = None
-                results = []
-                # Show waiting screen
-                wait_screen = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(wait_screen, "Connecting to ESP32-CAM...", (80, 220),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                cv2.putText(wait_screen, f"Target: {stream_url}", (80, 260),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-                network = "SmartHome-FaceCam" if cam_ip == "192.168.11.1" else "SmartHome-Net"
-                cv2.putText(wait_screen, f"Connect the laptop to {network}", (80, 300),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (150, 150, 150), 1)
-                cv2.imshow(window_name, wait_screen)
-                if (cv2.waitKey(30) & 0xFF) in (ord("q"), 27):
-                    break
-                continue
+            sample, received = reader.snapshot()
+            now = time.monotonic()
+            if now - measured_at >= 1.5:
+                elapsed = now - measured_at
+                received_fps = (received - received_before) / elapsed
+                preview_fps = (displayed - displayed_before) / elapsed
+                received_before, displayed_before = received, displayed
+                measured_at = now
 
-            now = time.time()
-            if now - fps_timer >= 1.0:
-                fps = fps_frames / (now - fps_timer)
-                fps_frames = 0
-                fps_timer = now
+            if analysis is not None:
+                source = analysis[0]
+                if (sample is None or source.connection != sample.connection
+                        or source.image.shape != sample.image.shape
+                        or now - source.received_at > FRAME_MAX_AGE):
+                    analysis = None
 
-            fresh_frame = frame is not last_frame
-            analyzed_frame = fresh_frame and (
-                last_frame is None or frame.shape != last_frame.shape or frame_i % detect_every == 0
-            )
-            if analyzed_frame:
-                t0 = time.perf_counter()
-                results = recognize(frame, known, tolerance)
-                infer_ms = int((time.perf_counter() - t0) * 1000.0)
-            if fresh_frame:
-                last_frame = frame
-                frame_i += 1
-                fps_frames += 1
-
-            # Draw recognition boxes and labels
-            display_frame = frame.copy()
-            annotate(display_frame, results)
-
-            # Draw HUD Overlays
-            h, w = display_frame.shape[:2]
-            cv2.rectangle(display_frame, (0, 0), (w, 36), (20, 20, 20), -1)
-            hud_info = (f"ESP32-CAM: {cam_ip} | {w}x{h} | {fps:.1f} FPS | "
-                        f"Infer: {infer_ms}ms | Enrolled: {len(known)}")
-            cv2.putText(display_frame, hud_info, (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (230, 230, 230), 1, cv2.LINE_AA)
-
-            cv2.rectangle(display_frame, (0, h - 26), (w, h), (20, 20, 20), -1)
-            cv2.putText(display_frame, "[SPACE] Save Photo  |  [E] Enroll Face  |  [Q] Quit",
-                        (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 230, 230), 1, cv2.LINE_AA)
-
-            # Determine decision and transmit to ESP32-CAM
-            if analyzed_frame and results:
-                # Prioritize any authorized match
-                matched = next((r for r in results if r[4] != "Unknown"), None)
-                if matched:
-                    top, right, bottom, left, name, distance = matched
-                    box = [int(left), int(top), int(right), int(bottom)]
-                    if now - last_feedback_time >= 0.35 or last_verdict_sent != "recognized":
-                        send_esp_feedback(base_url, "recognized", name, distance, box, infer_ms)
-                        last_feedback_time = now
-                        last_verdict_sent = "recognized"
-                        clean_disp = name.replace("-", " ").title()
-                        print(f"[ACCESS GRANTED] Recognized: {clean_disp} (distance {distance:.2f}) -> Hub Door Servo 3 Opened!")
+            if pending is not None:
+                try:
+                    results, inference_ms = replies.get_nowait()
+                except queue.Empty:
+                    pass
                 else:
-                    # All detected faces are Unknown
-                    top, right, bottom, left, _, _ = results[0]
-                    box = [int(left), int(top), int(right), int(bottom)]
-                    if now - last_feedback_time >= 0.40 or last_verdict_sent != "unknown":
-                        send_esp_feedback(base_url, "unknown", "Unknown", None, box, infer_ms)
-                        last_feedback_time = now
-                        last_verdict_sent = "unknown"
-                        print("[ACCESS DENIED] Unknown Person Detected -> Hub Intruder Siren Armed")
-            elif analyzed_frame:
-                # No face in view - send idle keepalive every 2.5s
-                if now - last_feedback_time >= 2.5:
-                    send_esp_feedback(base_url, "no_face", "---", None, None, 0)
-                    last_feedback_time = now
-                    last_verdict_sent = "no_face"
+                    source, submitted_known = pending
+                    pending = None
+                    if (sample is not None and source.connection == sample.connection
+                            and source.image.shape == sample.image.shape and submitted_known is known
+                            and now - source.received_at <= FRAME_MAX_AGE):
+                        analysis = source, results, inference_ms
+                        feedback = queue_feedback(feedback_pool, base_url, results, inference_ms, feedback)
 
-            cv2.imshow(window_name, display_frame)
+            if not worker.is_alive():
+                print("[esp-stream] Face analysis worker exited", file=sys.stderr)
+                break
+            if pending is None and sample is not None and sample is not last_analyzed:
+                # One frame in flight. On completion take the newest capture.
+                requests.put_nowait((sample.image, known if known is not worker_known else None))
+                pending = sample, known
+                worker_known, last_analyzed = known, sample
 
-            key = cv2.waitKey(1 if fresh_frame else 10) & 0xFF
+            try:
+                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) == 0:
+                    break
+                _, _, width, height = cv2.getWindowImageRect(window)
+                if width > 0 and height > 0:
+                    size = width, height
+            except cv2.error:
+                # Some HighGUI backends cannot report the drawable area.
+                pass
+            render_state = size, sample, analysis, received_fps, preview_fps
+            if render_state != last_render:
+                results = analysis[1] if analysis is not None else []
+                inference_ms = analysis[2] if analysis is not None else None
+                display = draw_preview(size, sample, results, received_fps, preview_fps, inference_ms)
+                cv2.imshow(window, display)
+                if sample is not None and (last_render is None or last_render[1] is not sample):
+                    displayed += 1
+                last_render = render_state
+
+            key = cv2.waitKey(8) & 0xFF
             if key in (ord("q"), 27):
                 break
-            elif key == ord(" "):
-                _save_annotated(display_frame, stem="esp-snap")
-            elif key in (ord("e"), ord("E")):
-                if results:
-                    top, right, bottom, left, cur_name, _ = results[0]
-                    box = (top, right, bottom, left)
-                    print("\n--- Instant Face Enrollment ---")
-                    new_name = input("Enter identity name (e.g. pola-lazem): ").strip()
-                    if new_name:
-                        if enroll_new_identity(frame, box, new_name):
-                            known = load_known_faces()
-                            print(f"[enroll] Enrolled! {len(known)} active identities in database.\n")
+            if key == ord(" ") and sample is not None:
+                _save_annotated(display, stem="esp-snap")
+            if key in (ord("e"), ord("E")):
+                if analysis is not None and analysis[1]:
+                    source, results, _ = analysis
+                    top, right, bottom, left, _, _ = results[0]
+                    new_name = input("Enter identity name: ").strip()
+                    if new_name and enroll_new_identity(source.image, (top, right, bottom, left), new_name):
+                        known = load_known_faces()
+                        analysis = None
                 else:
                     print("[enroll] Look directly into the camera so a face is detected first.")
 
@@ -510,6 +577,19 @@ def run_esp(
         pass
     finally:
         reader.stop()
+        feedback_pool.shutdown(wait=False, cancel_futures=True)
+        if worker.pid is not None:
+            try:
+                requests.put_nowait(None)
+            except queue.Full:
+                pass
+            worker.join(timeout=0.5)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
+        requests.cancel_join_thread()
+        requests.close()
+        replies.close()
         cv2.destroyAllWindows()
         print("\n[esp-stream] Stopped.")
 
@@ -526,6 +606,8 @@ def main() -> None:
                         help="ESP32-CAM MJPEG stream port (default: 81)")
     parser.add_argument("--http-port", type=int, default=80,
                         help="ESP32-CAM HTTP control port (default: 80)")
+    parser.add_argument("--resolution", choices=RESOLUTIONS,
+                        help="Set the ESP stream resolution before opening the preview")
     parser.add_argument("--tolerance", type=float, default=0.6,
                         help="match distance threshold (default 0.6, lower = stricter)")
     args = parser.parse_args()
@@ -552,6 +634,10 @@ def main() -> None:
     else:
         # Default mode: connect to ESP32-CAM stream
         cam_ip = args.esp if args.esp else "192.168.4.101"
+        try:
+            set_video_config(CAMERA_HTTP, f"http://{cam_ip}:{args.http_port}", args.resolution)
+        except (OSError, ValueError) as exc:
+            parser.exit(1, f"Camera configuration failed: {exc}\n")
         run_esp(cam_ip, args.http_port, args.stream_port, known, args.tolerance)
 
 

@@ -20,6 +20,8 @@ constexpr int FLASH_LEDC_CHANNEL = 2; // Avoid LEDC channel 0 used by camera XCL
 constexpr int MAX_STREAM_CLIENTS = 4;
 constexpr size_t PART_HEADER_RESERVE = 96;
 constexpr size_t PART_TRAILER_RESERVE = 2;
+constexpr size_t VGA_JPEG_RESERVE = 64 * 1024;
+constexpr int CAMERA_XCLK_HZ = 20000000;
 constexpr size_t TCP_SEND_CHUNK_BYTES = 4096;
 constexpr unsigned long FRAME_SEND_STALL_MS = 750;
 constexpr unsigned long FRAME_SEND_LIMIT_MS = 1500;
@@ -31,12 +33,13 @@ uint8_t *s_previewJpg = nullptr;
 size_t s_previewJpgLen = 0;
 size_t s_previewJpgCap = 0;
 size_t s_previewHeaderLen = 0;
-volatile uint32_t s_previewFrameSeq = 0;
+std::atomic<uint32_t> s_previewFrameSeq{0};
 std::atomic<int> s_streamClientCount{0};
 volatile unsigned long s_lastPreviewReqMs = 0;
 volatile unsigned long s_lastPreviewEncodeMs = 0;
 bool s_streamServerStarted = false;
 bool s_flashAvailable = false;
+CamCaptureProfile s_captureProfile;
 
 struct CamInitCtx {
   const camera_config_t *cfg;
@@ -128,25 +131,29 @@ void serveStreamClient(StreamClient &client) {
   unsigned long lastFrameMs = millis();
   while (client.socket.connected() && millis() - lastFrameMs < FRAME_IDLE_TIMEOUT_MS) {
     size_t packetLen = 0;
+    size_t needed = 0;
     if (xSemaphoreTake(s_previewMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
-      if (s_previewJpgLen != 0 && s_previewFrameSeq != lastSeq) {
-        size_t needed = s_previewHeaderLen + s_previewJpgLen + PART_TRAILER_RESERVE;
-        if (needed > capacity) {
-          size_t newCapacity = (needed + 4095) & ~size_t(4095);
-          auto *buffer = static_cast<uint8_t *>(ps_realloc(packet, newCapacity));
-          if (!buffer) buffer = static_cast<uint8_t *>(realloc(packet, newCapacity));
-          if (buffer) {
-            packet = buffer;
-            capacity = newCapacity;
-          }
-        }
+      const uint32_t latestSeq = s_previewFrameSeq.load();
+      if (s_previewJpgLen != 0 && latestSeq != lastSeq) {
+        needed = s_previewHeaderLen + s_previewJpgLen + PART_TRAILER_RESERVE;
         if (needed <= capacity) {
           memcpy(packet, s_previewJpg - s_previewHeaderLen, needed);
           packetLen = needed;
-          lastSeq = s_previewFrameSeq;
+          lastSeq = latestSeq;
         }
       }
       xSemaphoreGive(s_previewMutex);
+    }
+
+    // A viewer can allocate its send buffer without blocking camera capture.
+    if (needed > capacity) {
+      size_t newCapacity = (needed + 4095) & ~size_t(4095);
+      auto *buffer = static_cast<uint8_t *>(ps_realloc(packet, newCapacity));
+      if (!buffer) buffer = static_cast<uint8_t *>(realloc(packet, newCapacity));
+      if (!buffer) break;
+      packet = buffer;
+      capacity = newCapacity;
+      continue;
     }
 
     // Only one frame per viewer can be in flight. After sending it, pick up
@@ -290,20 +297,19 @@ bool camHwInitCamera(pixformat_t pixelFormat,
   config.pin_sccb_scl = CAM_HW_SIOC_GPIO_NUM;
   config.pin_pwdn = CAM_HW_PWDN_GPIO_NUM;
   config.pin_reset = CAM_HW_RESET_GPIO_NUM;
-  // Use 20 MHz XCLK on original ESP32 (80 MHz APB / 4 = exact 50% duty cycle square wave).
-  // Avoids the asymmetric LEDC odd-divider clock at 16 MHz that causes RGB565 pixel color corruption.
-  config.xclk_freq_hz = 20000000;
+  // Match the 20 MHz JPEG streaming clock in the Arduino CameraWebServer example.
+  config.xclk_freq_hz = CAMERA_XCLK_HZ;
   config.pixel_format = pixelFormat;
   const bool hasPsram = psramFound();
   // Reserve enough DMA buffer space for all advertised presets. The sensor
   // switches to the selected size before the application publishes frames.
   config.frame_size = hasPsram ? FRAMESIZE_VGA : frameSize;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  const bool continuousJpeg = hasPsram && pixelFormat == PIXFORMAT_JPEG;
+  config.grab_mode = continuousJpeg ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = hasPsram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.jpeg_quality = jpegQuality;
-  // Triple buffering keeps capture DMA fed while the stream task transmits the
-  // previous frame. This is especially important on the S3 camera with PSRAM.
-  config.fb_count = hasPsram ? 3 : 1;
+  // With two buffers the driver captures continuously and queues one latest frame.
+  config.fb_count = continuousJpeg ? 2 : 1;
 
   // Always execute esp_camera_init on Core 0 (PRO_CPU) so esp_intr_alloc binds
   // ll_cam_vsync_isr and ll_cam_dma_isr to Core 0 instead of Core 1 (AI core).
@@ -339,7 +345,8 @@ bool camHwInitCamera(pixformat_t pixelFormat,
     if (!hasPsram && config.frame_size > FRAMESIZE_QVGA) {
       config.frame_size = FRAMESIZE_QVGA;
     }
-    config.fb_count = hasPsram ? 3 : 1;
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
     if (xPortGetCoreID() == 0) {
       err = esp_camera_init(&config);
@@ -373,9 +380,7 @@ bool camHwInitCamera(pixformat_t pixelFormat,
       Serial.println("[CAM_HW] Failed to apply startup resolution");
       return false;
     }
-    Serial.printf("[CAM_HW] Sensor initialized: PID 0x%02X, pixel_format=%s\n",
-                  s->id.PID,
-                  config.pixel_format == PIXFORMAT_JPEG ? "Hardware JPEG" : "RGB565 (Software JPEG)");
+    s_captureProfile.sensorPid = s->id.PID;
     if (s->set_hmirror) s->set_hmirror(s, hmirror ? 1 : 0);
     if (s->set_vflip) s->set_vflip(s, vflip ? 1 : 0);
     if (s->set_contrast) s->set_contrast(s, contrast);
@@ -405,7 +410,18 @@ bool camHwInitCamera(pixformat_t pixelFormat,
     }
     delay(15);
   }
+  s_captureProfile.sensorJpeg = config.pixel_format == PIXFORMAT_JPEG;
+  s_captureProfile.frameBuffers = config.fb_count;
+  Serial.printf("[CAM_HW] PID 0x%04X, %s, %u frame buffers, XCLK %d MHz, flash %u MiB, PSRAM %u MiB\n",
+                s_captureProfile.sensorPid, s_captureProfile.sensorJpeg ? "sensor JPEG" : "software JPEG",
+                s_captureProfile.frameBuffers, CAMERA_XCLK_HZ / 1000000,
+                static_cast<unsigned>(ESP.getFlashChipSize() / (1024 * 1024)),
+                static_cast<unsigned>(ESP.getPsramSize() / (1024 * 1024)));
   return true;
+}
+
+CamCaptureProfile camHwCaptureProfile() {
+  return s_captureProfile;
 }
 
 void camHwInitPreview() {
@@ -415,12 +431,19 @@ void camHwInitPreview() {
   for (auto &client : s_streamClients) {
     if (!client.frameReady) client.frameReady = xSemaphoreCreateBinary();
   }
+  if (!s_previewAlloc && psramFound()) {
+    s_previewAlloc = static_cast<uint8_t *>(ps_malloc(PART_HEADER_RESERVE + VGA_JPEG_RESERVE + PART_TRAILER_RESERVE));
+    if (s_previewAlloc) {
+      s_previewJpg = s_previewAlloc + PART_HEADER_RESERVE;
+      s_previewJpgCap = VGA_JPEG_RESERVE;
+    }
+  }
 }
 
 void publishPreviewJpeg(const uint8_t *jpgBuf, size_t jpgLen) {
   if (!jpgBuf || jpgLen == 0) return;
 
-  if (s_previewMutex && xSemaphoreTake(s_previewMutex, pdMS_TO_TICKS(40)) == pdTRUE) {
+  if (s_previewMutex && xSemaphoreTake(s_previewMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     if (jpgLen > s_previewJpgCap) {
       size_t newCap = (jpgLen + 8191) & ~4095;
       if (newCap < 32768) newCap = 32768;
@@ -526,7 +549,7 @@ void camHwStartStreamServer(uint16_t port) {
 }
 
 uint32_t camHwGetPreviewFrameSeq() {
-  return s_previewFrameSeq;
+  return s_previewFrameSeq.load();
 }
 
 bool camHwHasStreamClients() {
