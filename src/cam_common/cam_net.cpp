@@ -11,8 +11,8 @@
 namespace {
 
 constexpr unsigned long HUB_CONNECT_GRACE_MS = 12000;
-constexpr unsigned long STA_RETRY_INTERVAL_MS = 10000;
-constexpr unsigned long STA_RETRY_FALLBACK_AP_MS = 30000;
+constexpr unsigned long FALLBACK_RETRY_INTERVAL_MS = 30000;
+constexpr unsigned long FALLBACK_PROBE_TIMEOUT_MS = 5000;
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 5000;
 
 const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -27,8 +27,9 @@ uint8_t s_hubChannel = 0;
 
 volatile bool s_fallbackApActive = false;
 bool s_wasStaConnected = false;
-unsigned long s_bootMs = 0;
+bool s_fallbackProbeActive = false;
 unsigned long s_lastStaAttemptMs = 0;
+unsigned long s_lastApAttemptMs = 0;
 unsigned long s_lastHeartbeatMs = 0;
 
 volatile bool s_lastSendOk = true;
@@ -95,39 +96,49 @@ void syncHubPeerLocked() {
   }
 }
 
-void startFallbackApLocked() {
-  if (s_fallbackApActive) return;
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
-
-  IPAddress apIp(192, 168, 11, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.softAPConfig(apIp, apIp, subnet);
-
-  String apSsid = camNetFallbackApSsid();
-  if (WiFi.softAP(apSsid.c_str(), SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL, 0, 2)) {
-    s_fallbackApActive = true;
-    Serial.print("Fallback setup AP active: ");
-    Serial.print(apSsid);
-    Serial.print(" at http://");
-    Serial.println(WiFi.softAPIP());
+void startHubConnection() {
+  const uint8_t *ip = SmartHomeNet::FACE_CAM_IP;
+  const uint8_t *hub = SmartHomeNet::HUB_IP;
+  const uint8_t *mask = SmartHomeNet::SUBNET_MASK;
+  if (WiFi.config(IPAddress(ip[0], ip[1], ip[2], ip[3]),
+                  IPAddress(hub[0], hub[1], hub[2], hub[3]),
+                  IPAddress(mask[0], mask[1], mask[2], mask[3]))) {
+    WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS);
+  } else {
+    Serial.println("[WIFI] Failed to configure camera station IP");
   }
 }
 
-void stopFallbackApLocked() {
-  if (!s_fallbackApActive) return;
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
+bool startFallbackApLocked() {
+  IPAddress apIp(192, 168, 11, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  String apSsid = camNetFallbackApSsid();
+  // Remove the STA interface so its scans cannot interrupt association or DHCP.
+  if (!WiFi.mode(WIFI_AP) || !WiFi.softAPConfig(apIp, apIp, subnet) ||
+      !WiFi.softAP(apSsid.c_str(), SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL, 0, 2)) {
+    Serial.println("[WIFI] Failed to start fallback AP or configure its IP/DHCP");
+    return false;
+  }
+  WiFi.setSleep(false);
+  s_fallbackApActive = true;
+  Serial.printf("Fallback setup AP active: %s at http://%s\n",
+                apSsid.c_str(), WiFi.softAPIP().toString().c_str());
+  return true;
+}
+
+bool stopFallbackApLocked() {
+  if (!s_fallbackApActive) return true;
+  if (!WiFi.mode(WIFI_STA)) return false;
   WiFi.setSleep(false);
   s_fallbackApActive = false;
   Serial.println("Main Hub reachable; fallback setup AP disabled.");
+  return true;
 }
 
 } // namespace
 
 void camNetInit(SmartHomeNet::CamSource source) {
   s_source = source;
-  s_bootMs = millis();
   if (!s_netMutex) {
     s_netMutex = xSemaphoreCreateMutex();
   }
@@ -137,19 +148,9 @@ void camNetInit(SmartHomeNet::CamSource source) {
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setAutoReconnect(true);
-
-  const uint8_t *ipArr = SmartHomeNet::FACE_CAM_IP;
-  IPAddress localIp(ipArr[0], ipArr[1], ipArr[2], ipArr[3]);
-  IPAddress hubIp(SmartHomeNet::HUB_IP[0], SmartHomeNet::HUB_IP[1],
-                  SmartHomeNet::HUB_IP[2], SmartHomeNet::HUB_IP[3]);
-  IPAddress subnet(SmartHomeNet::SUBNET_MASK[0], SmartHomeNet::SUBNET_MASK[1],
-                   SmartHomeNet::SUBNET_MASK[2], SmartHomeNet::SUBNET_MASK[3]);
-  WiFi.config(localIp, hubIp, subnet);
-
-  // Dynamic channel scan: do not specify channel so STA scans all channels to find Hub
-  WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS);
-  s_lastStaAttemptMs = s_bootMs;
+  WiFi.setAutoReconnect(false);
+  s_lastStaAttemptMs = millis();
+  startHubConnection();
 
   if (esp_now_init() == ESP_OK) {
     s_espNowReady = true;
@@ -170,26 +171,39 @@ void camNetLoop() {
 
   wl_status_t st = WiFi.status();
   bool triggerImmediateHeartbeat = false;
-  if (st == WL_CONNECTED) {
-    stopFallbackApLocked();
+  if (st == WL_CONNECTED && (!s_fallbackApActive || WiFi.softAPgetStationNum() == 0) &&
+      stopFallbackApLocked()) {
+    s_fallbackProbeActive = false;
     syncHubPeerLocked();
     if (!s_wasStaConnected) {
       s_wasStaConnected = true;
       triggerImmediateHeartbeat = true;
     }
   } else {
-    s_wasStaConnected = false;
-    if (!s_fallbackApActive && (now - s_bootMs >= HUB_CONNECT_GRACE_MS)) {
-      startFallbackApLocked();
-    }
-    bool hasApClients = s_fallbackApActive && (WiFi.softAPgetStationNum() > 0);
-    unsigned long retryMs = hasApClients ? STA_RETRY_FALLBACK_AP_MS : STA_RETRY_INTERVAL_MS;
-    if (now - s_lastStaAttemptMs >= retryMs) {
+    if (s_wasStaConnected) {
+      s_wasStaConnected = false;
       s_lastStaAttemptMs = now;
-      // Avoid resetting SoftAP HTTP state with full WiFi.begin() while serving fallback clients
-      if (!WiFi.reconnect()) {
-        WiFi.begin(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS);
+      startHubConnection();
+    }
+    if (s_fallbackApActive) {
+      const bool hasClients = WiFi.softAPgetStationNum() > 0;
+      if (hasClients) {
+        // Start a fresh idle interval once the last client leaves.
+        s_lastStaAttemptMs = now;
       }
+      if (s_fallbackProbeActive) {
+        if (hasClients || now - s_lastStaAttemptMs >= FALLBACK_PROBE_TIMEOUT_MS) {
+          s_fallbackProbeActive = !WiFi.mode(WIFI_AP);
+        }
+      } else if (!hasClients && now - s_lastStaAttemptMs >= FALLBACK_RETRY_INTERVAL_MS) {
+        s_lastStaAttemptMs = now;
+        s_fallbackProbeActive = WiFi.mode(WIFI_AP_STA);
+        if (s_fallbackProbeActive) startHubConnection();
+      }
+    } else if (now - s_lastStaAttemptMs >= HUB_CONNECT_GRACE_MS &&
+               now - s_lastApAttemptMs >= FALLBACK_PROBE_TIMEOUT_MS) {
+      s_lastApAttemptMs = now;
+      if (startFallbackApLocked()) s_lastStaAttemptMs = now;
     }
   }
 
@@ -197,7 +211,8 @@ void camNetLoop() {
     xSemaphoreGive(s_netMutex);
   }
 
-  if (triggerImmediateHeartbeat || (now - s_lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)) {
+  if (s_wasStaConnected &&
+      (triggerImmediateHeartbeat || now - s_lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)) {
     s_lastHeartbeatMs = now;
     camNetSendEvent(SmartHomeNet::CAM_EVENT_HEARTBEAT, 0, 100, "FACE-CAM");
   }
@@ -252,7 +267,7 @@ bool camNetSendEvent(SmartHomeNet::CamEventType event,
                      int16_t matchId,
                      uint8_t confidence,
                      const char *label) {
-  if (!s_espNowReady) return false;
+  if (!s_espNowReady || !s_wasStaConnected || WiFi.status() != WL_CONNECTED) return false;
 
   if (s_netMutex && xSemaphoreTake(s_netMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
     return false;

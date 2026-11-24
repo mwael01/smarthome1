@@ -131,7 +131,9 @@ pio device monitor -b 115200
    - **Face camera stream**: `http://192.168.4.101` — The laptop runs enrollment, face detection, and recognition against the live MJPEG stream.
    - **Main Hub**: `http://192.168.4.1` — RFID authorization controls the car gate.
 
-> **Standalone Bench Setup (Hub Powered Off)**: If a camera cannot find `SmartHome-Net` within `12 s` of boot, it starts a temporary setup hotspot (`SmartHome-FaceCam` at `http://192.168.11.1`, , password `smarthome123`) while continuing to scan for the Hub in the background.
+> **Standalone bench setup**
+>
+> If the camera cannot join `SmartHome-Net` within about 12 seconds, connect to `SmartHome-FaceCam` using `smarthome123`, then open `http://192.168.11.1`. This network has no internet access. The camera retries the hub after the hotspot has been idle for 30 seconds and closes the hotspot once it rejoins the hub.
 
 ---
 
