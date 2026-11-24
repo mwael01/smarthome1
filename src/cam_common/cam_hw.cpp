@@ -20,6 +20,7 @@ constexpr int MAX_STREAM_CLIENTS = 4;
 constexpr size_t PART_HEADER_RESERVE = 96;
 constexpr size_t PART_TRAILER_RESERVE = 2;
 constexpr size_t TCP_SEND_CHUNK_BYTES = 2872; // 2x TCP MSS (fits inside 5744B lwIP TCP_SND_BUF)
+constexpr unsigned long FRAME_SEND_TIMEOUT_MS = 250;
 
 SemaphoreHandle_t s_previewMutex = nullptr;
 SemaphoreHandle_t s_newFrameSem = nullptr;
@@ -34,6 +35,7 @@ volatile int s_streamClientCount = 0;
 volatile unsigned long s_lastPreviewReqMs = 0;
 volatile unsigned long s_lastPreviewEncodeMs = 0;
 bool s_streamServerStarted = false;
+bool s_flashAvailable = false;
 
 struct CamInitCtx {
   const camera_config_t *cfg;
@@ -48,17 +50,15 @@ void camInitCore0Task(void *arg) {
   vTaskDelete(nullptr);
 }
 
-// Native ESP-IDF lwIP socket transmitter (matches esp_http_server httpd_send_all).
-// Sends in 2x-MSS chunks using blocking lwip_send with SO_SNDTIMEO and yields to
-// the Core 0 Wi-Fi/lwIP tasks on EAGAIN so frames larger than TCP_SND_BUF (5744B)
-// never fail on partial writes.
+// Bound the time spent on a frame so a slow reader cannot stall every viewer.
 bool sendPacketAll(int fd, const uint8_t *buf, size_t len, bool &outPeerClosed) {
   outPeerClosed = false;
   if (fd < 0) return false;
 
   size_t sent = 0;
-  int eagainRetries = 0;
+  const unsigned long startMs = millis();
   while (sent < len) {
+    if (millis() - startMs >= FRAME_SEND_TIMEOUT_MS) return false;
     size_t chunk = len - sent;
     if (chunk > TCP_SEND_CHUNK_BYTES) {
       chunk = TCP_SEND_CHUNK_BYTES;
@@ -66,12 +66,8 @@ bool sendPacketAll(int fd, const uint8_t *buf, size_t len, bool &outPeerClosed) 
     ssize_t n = lwip_send(fd, buf + sent, chunk, 0);
     if (n > 0) {
       sent += static_cast<size_t>(n);
-      eagainRetries = 0;
     } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      if (++eagainRetries > 30) {
-        return false;
-      }
-      vTaskDelay(pdMS_TO_TICKS(8));
+      vTaskDelay(1);
     } else {
       if (n == 0 || errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN || errno == ECONNABORTED) {
         outPeerClosed = true;
@@ -80,6 +76,25 @@ bool sendPacketAll(int fd, const uint8_t *buf, size_t len, bool &outPeerClosed) 
     }
   }
   return true;
+}
+
+bool readStreamRequest(WiFiClient &client) {
+  constexpr char headerEnd[] = "\r\n\r\n";
+  const unsigned long startMs = millis();
+  size_t matched = 0;
+  while (client.connected() && millis() - startMs < 200) {
+    int byte = client.read();
+    if (byte < 0) {
+      vTaskDelay(1);
+      continue;
+    }
+    if (byte == headerEnd[matched]) {
+      if (++matched == sizeof(headerEnd) - 1) return true;
+    } else {
+      matched = byte == '\r' ? 1 : 0;
+    }
+  }
+  return false;
 }
 
 void camStreamTask(void *pvParameters) {
@@ -103,8 +118,11 @@ void camStreamTask(void *pvParameters) {
         if (fd >= 0) {
           struct timeval tv = {};
           tv.tv_sec = 0;
-          tv.tv_usec = 600000; // 600 ms blocking send timeout per chunk
-          lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+          tv.tv_usec = 50000;
+          if (lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
+            newClient.stop();
+            continue;
+          }
         }
         int slot = -1;
         for (int i = 0; i < MAX_STREAM_CLIENTS; ++i) {
@@ -117,27 +135,17 @@ void camStreamTask(void *pvParameters) {
           if (clients[slot]) {
             clients[slot].stop();
           }
-          // Read HTTP request lines (fast timeout avoids stalling existing streams)
-          unsigned long t0 = millis();
-          while (newClient.connected() && (millis() - t0 < 200)) {
-            if (newClient.available()) {
-              String l = newClient.readStringUntil('\n');
-              if (l == "\r" || l.length() == 0) break;
-            } else {
-              vTaskDelay(pdMS_TO_TICKS(5));
-            }
-          }
-
           // Send multipart headers
           static const char STREAM_HDR[] =
               "HTTP/1.1 200 OK\r\n"
-              "Content-Type: multipart/x-mixed-replace; boundary=--frame\r\n"
+              "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
               "Access-Control-Allow-Origin: *\r\n"
               "Connection: close\r\n"
               "Cache-Control: no-cache, no-store, must-revalidate, max-age=0\r\n"
               "Pragma: no-cache\r\n\r\n";
           bool closed = false;
-          if (sendPacketAll(newClient.fd(),
+          if (readStreamRequest(newClient) &&
+              sendPacketAll(newClient.fd(),
                             reinterpret_cast<const uint8_t *>(STREAM_HDR),
                             sizeof(STREAM_HDR) - 1,
                             closed)) {
@@ -148,7 +156,9 @@ void camStreamTask(void *pvParameters) {
             newClient.stop();
           }
         } else {
-          newClient.print("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nBusy\r\n");
+          static const char BUSY[] = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+          bool closed = false;
+          sendPacketAll(newClient.fd(), reinterpret_cast<const uint8_t *>(BUSY), sizeof(BUSY) - 1, closed);
           newClient.stop();
         }
       }
@@ -242,21 +252,33 @@ void camStreamTask(void *pvParameters) {
 } // namespace
 
 void camHwInitLeds() {
+#if CAM_HW_STATUS_LED_PIN >= 0
   pinMode(CAM_HW_STATUS_LED_PIN, OUTPUT);
   camHwSetStatusLed(false);
+#endif
 
-  ledcSetup(FLASH_LEDC_CHANNEL, 5000, 8);
-  ledcAttachPin(CAM_HW_FLASH_LED_PIN, FLASH_LEDC_CHANNEL);
-  camHwSetFlashLed(0);
+#if CAM_HW_FLASH_LED_PIN >= 0
+  if (ledcSetup(FLASH_LEDC_CHANNEL, 5000, 8) > 0) {
+    ledcWrite(FLASH_LEDC_CHANNEL, 0);
+    ledcAttachPin(CAM_HW_FLASH_LED_PIN, FLASH_LEDC_CHANNEL);
+    s_flashAvailable = true;
+  }
+#endif
+}
+
+bool camHwFlashAvailable() {
+  return s_flashAvailable;
 }
 
 void camHwSetStatusLed(bool on) {
+#if CAM_HW_STATUS_LED_PIN >= 0
   // AI-Thinker red status LED on GPIO33 is active-LOW
   digitalWrite(CAM_HW_STATUS_LED_PIN, on ? LOW : HIGH);
+#endif
 }
 
 void camHwSetFlashLed(uint8_t duty) {
-  ledcWrite(FLASH_LEDC_CHANNEL, duty);
+  if (s_flashAvailable) ledcWrite(FLASH_LEDC_CHANNEL, duty);
 }
 
 void camHwApplySensorSettings(bool hmirror,
@@ -520,14 +542,14 @@ void camHwHandlePreviewRequest(WebServer &server) {
 
 void camHwStartStreamServer(uint16_t port) {
   if (s_streamServerStarted) return;
-  s_streamServerStarted = true;
-  xTaskCreatePinnedToCore(camStreamTask,
+  s_streamServerStarted = xTaskCreatePinnedToCore(camStreamTask,
                           "cam_stream",
                           6144,
                           reinterpret_cast<void *>(static_cast<uintptr_t>(port)),
                           2,
                           nullptr,
-                          0); // Pin to Core 0 at prio 2 so ready frames transmit immediately
+                          0) == pdPASS;
+  if (!s_streamServerStarted) Serial.println("[CAM_STREAM] Could not start stream task");
 }
 
 uint32_t camHwGetPreviewFrameSeq() {

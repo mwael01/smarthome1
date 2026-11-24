@@ -102,7 +102,7 @@ class EspCamStreamClient:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             buf = bytearray()
             while True:
-                chunk = resp.read(8192)
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 buf.extend(chunk)
@@ -332,7 +332,10 @@ class LaptopFaceBridge:
             except Exception as exc:
                 if not self._stop.is_set():
                     print(f"[LAPTOP-AI] Stream reconnecting ({exc})...", file=sys.stderr)
-                    time.sleep(1.0)
+            finally:
+                with self._jpg_lock:
+                    self._latest_jpg = None
+            self._stop.wait(1.0)
 
     def _status_sync_loop(self):
         """Periodically sync enrolled names and ESP-CAM commands in the background."""

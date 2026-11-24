@@ -119,6 +119,7 @@ bool startFallbackApLocked() {
     Serial.println("[WIFI] Failed to start fallback AP or configure its IP/DHCP");
     return false;
   }
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
   s_fallbackApActive = true;
   Serial.printf("Fallback setup AP active: %s at http://%s\n",
@@ -144,11 +145,16 @@ void camNetInit(SmartHomeNet::CamSource source) {
   }
 
   WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+#ifdef CAMERA_STANDALONE
+  s_lastApAttemptMs = millis();
+  startFallbackApLocked();
+  return;
+#endif
   WiFi.mode(WIFI_STA);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setAutoReconnect(false);
   s_lastStaAttemptMs = millis();
   startHubConnection();
 
@@ -165,6 +171,13 @@ void camNetInit(SmartHomeNet::CamSource source) {
 
 void camNetLoop() {
   unsigned long now = millis();
+#ifdef CAMERA_STANDALONE
+  if (!s_fallbackApActive && now - s_lastApAttemptMs >= FALLBACK_PROBE_TIMEOUT_MS) {
+    s_lastApAttemptMs = now;
+    startFallbackApLocked();
+  }
+  return;
+#endif
   if (s_netMutex && xSemaphoreTake(s_netMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
     return;
   }

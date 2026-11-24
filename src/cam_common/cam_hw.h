@@ -41,13 +41,17 @@
 #define CAM_HW_VSYNC_GPIO_NUM  6
 #define CAM_HW_HREF_GPIO_NUM   7
 #define CAM_HW_PCLK_GPIO_NUM  13
-#define CAM_HW_FLASH_LED_PIN   2
-#define CAM_HW_STATUS_LED_PIN 48
+// ESP32-S3-EYE has no dedicated flash. GPIO2 is mic data and GPIO48 is LCD backlight.
+#ifndef CAM_HW_FLASH_LED_PIN
+#define CAM_HW_FLASH_LED_PIN  -1
+#endif
+#define CAM_HW_STATUS_LED_PIN -1
 #else
 #error "Define a supported camera model"
 #endif
 
 void camHwInitLeds();
+bool camHwFlashAvailable();
 void camHwSetStatusLed(bool on);
 void camHwSetFlashLed(uint8_t duty);
 

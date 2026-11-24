@@ -605,7 +605,7 @@ def make_stream_handler(cam: StreamCamState):
                 self.send_error(404)
                 return
             self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=--frame")
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()

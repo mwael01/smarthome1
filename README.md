@@ -70,38 +70,19 @@ A multi-node ESP32 smart home safety and biometric access-control system built w
 | **Face Door Servo 3** | `PWM` | `GPIO26` | `ESP32Servo` 50 Hz (16-bit, Timer 0) | Opens `0° → 160°` (`3 s`) on recognized face from Camera 1 |
 | **MFRC522 RFID Reader** | `SDA` / `SS`<br>`SCK`<br>`MOSI`<br>`MISO`<br>`RST` | `GPIO5`<br>`GPIO14`<br>`GPIO13`<br>`GPIO12`<br>`GPIO22` | Hardware SPI (`MFRC522`) | Reads 13.56 MHz RFID tags; accepted UID: `52411902` |
 
-### ESP32-S3 Face Camera (Laptop AI) Runtime Wiring & Main ESP32 Hub Link
+### ESP32-S3 camera power and flash
 
-At runtime, ESP32-S3 face camera requires **only 5 V power and common ground**—all face recognition events, heartbeats, and live video streams are transmitted wirelessly to the Main ESP32 Hub:
+The camera firmware uses the ESP32-S3-EYE camera pinout. If you have a different ESP32-S3 camera board, verify its schematic before wiring or flashing. On the Espressif ESP32-S3-EYE, use the onboard USB port for power and flashing.
 
-| `HW-297` Pin / Subsystem | Connection / Internal GPIO | Function & Best-Practice Wiring Notes |
-| --- | --- | --- |
-| **`5V`** | **Dedicated `5 V` Rail (`≥ 2 A`)** | Power via the `5V` pin (feeds onboard AMS1117-3.3V). **Never** power from the Main ESP32's `3V3` pin; add a `470 µF–1000 µF` bulk capacitor across `5V` and `GND` near the camera to prevent Wi-Fi/flash brownouts. |
-| **`GND`** | **Common `GND`** (Shared with Main ESP32 & Servos) | Tie all power supply, Main ESP32, servo, and `HW-297` grounds together. |
-| **`IO0`** | **Disconnected (Floating) at Runtime** | Must **only** be tied to `GND` while flashing firmware. Leave disconnected for normal boot. |
-| **`U0T` (`GPIO1`) / `U0R` (`GPIO3`)** | Optional USB-TTL `RX` / `TX` (`115200` baud) | Used for flashing or viewing `[FACE]` Serial debug logs; leave unconnected in standalone deployment. |
-| **Onboard Flash LED** | Internal `GPIO4` (LEDC Ch 2, 5 kHz, 8-bit) | Auto-flash hysteresis in low light (`sceneLuma < 0.18` → ON at duty `48`, `> 0.40` → OFF) or manual slider (`0–180`). |
-| **Onboard Red Status LED** | Internal `GPIO33` (Active-LOW) | Illuminates (`LOW`) when an enrolled face is recognized; turns off (`HIGH`) when idle or unknown. |
-| **OV2640 Camera Bus** | Internal `XCLK=0` (LEDC Ch 0), `SIOD=26`, `SIOC=27`, `PWDN=32`, `VSYNC=25`, `HREF=23`, `PCLK=22`, `D0..D7=5,18,19,21,36,39,34,35` | Captures `240×240` `RGB565` frames in PSRAM (`CAMERA_GRAB_LATEST`, double-buffered) with automatic self-healing if frame grabs stall. |
-| **Wireless Link → Main ESP32 Hub** | Wi-Fi SoftAP `SmartHome-Net` (`192.168.4.101` → `192.168.4.1`) | **Dual-Path Event Delivery**: Sends 37-byte `CamEventPacket` over **ESP-NOW** + fallback **HTTP POST `/api/cam/event`** with sequence deduplication (`seq`):<br>• `CAM_EVENT_RECOGNIZED` → Unlocks **Face Door Servo 3 (`GPIO26`, `0° → 160°` for `3 s`)** + speaks *"Door unlocked"* on `GPIO4`<br>• `CAM_EVENT_UNKNOWN` (confirmed over `2` frames) → Triggers **Intruder Siren (`GPIO25`, `4 s`)** + speaks *"Access denied"* on `GPIO4`<br>• `CAM_EVENT_HEARTBEAT` (every `5 s` + immediate on connect) → Keeps Camera 1 online status & Hub proxy (`/api/cam/1/preview.jpg`) active |
+The ESP32-S3-EYE has no dedicated camera flash. GPIO2 is microphone data, GPIO48 is the LCD backlight, and GPIO3 is the module power indicator. Flash controls stay disabled until a verified flash-control GPIO is configured. [Espressif board guide](https://docs.espressif.com/projects/esp-board-manager/en/latest/references/boards/esp32_s3_eye.html) · [Espressif pin map](https://github.com/espressif/esp-bsp/blob/master/bsp/esp32_s3_eye/esp32_s3_eye.json)
 
-### Flashing the ESP32-S3 camera Boards via USB-TTL
-
-`HW-297` has no onboard USB-UART bridge. Connect your 3.3 V USB-TTL adapter as follows:
-
-| USB-TTL | `HW-297` Pin | Notes |
-| --- | --- | --- |
-| `5V` (or External 5 V PSU) | `5V` | Do **not** under-power; brownouts cause camera/Wi-Fi init failures |
-| `GND` | `GND` | Common ground |
-| `TX` | `U0R` (`GPIO3`) | Cross TX → RX |
-| `RX` | `U0T` (`GPIO1`) | Cross RX → TX |
-| *(Flash jumper only)* | **`IO0` → `GND`** | Tie `IO0` to `GND` and press **`RST`**, run `upload`, then **remove `IO0–GND`** and press **`RST`** to boot normally |
+For an external light, use a driver with a 3.3 V-compatible active-high PWM input. Wire the verified GPIO to the driver input, share ground between the camera and driver, and power the light from its rated supply through the driver. Set `-DCAM_HW_FLASH_LED_PIN=<verified GPIO>` in the camera build flags.
 
 ---
 
 ## Build & Upload (PlatformIO)
 
-[`platformio.ini`](platformio.ini) defines four environments:
+[`platformio.ini`](platformio.ini) defines three firmware targets:
 
 ```bash
 # Build all firmwares at once
@@ -110,7 +91,7 @@ pio run
 # 1) Flash Main ESP32 Hub (esp32dev)
 pio run -e esp32dev -t upload
 
-# 2) Flash ESP32-S3 face camera — IO0 grounded during upload
+# 2) Flash ESP32-S3 face camera for use with the hub
 pio run -e cam_face_stream_s3 -t upload
 
 ```
@@ -125,7 +106,7 @@ pio device monitor -b 115200
 ## Web Dashboards & Enrollment
 
 1. Power on the **Main Hub** first (`SmartHome-Net` SoftAP starts on channel `1`).
-2. Power on the **ESP32-S3 face camera** (with `IO0` disconnected from `GND`). It automatically joins `SmartHome-Net`.
+2. Power on the **ESP32-S3 face camera**. It automatically joins `SmartHome-Net`.
 3. Connect your phone or laptop to Wi-Fi **`SmartHome-Net`** (password: **`smarthome123`**):
    - **Main Hub Status**: `http://192.168.4.1`
    - **Face camera stream**: `http://192.168.4.101` — The laptop runs enrollment, face detection, and recognition against the live MJPEG stream.
@@ -134,6 +115,14 @@ pio device monitor -b 115200
 > **Standalone bench setup**
 >
 > If the camera cannot join `SmartHome-Net` within about 12 seconds, connect to `SmartHome-FaceCam` using `smarthome123`, then open `http://192.168.11.1`. This network has no internet access. The camera retries the hub after the hotspot has been idle for 30 seconds and closes the hotspot once it rejoins the hub.
+
+### Standalone camera preview and speed test
+
+1. Flash just the camera with `pio run -e cam_face_stream_s3_standalone -t upload`. This build starts the hotspot at boot and keeps it dedicated to the direct laptop link.
+2. Join `SmartHome-FaceCam` using `smarthome123`. Open the dashboard at `http://192.168.11.1` or the direct MJPEG preview at `http://192.168.11.1:81/stream`.
+3. Close the preview before measuring single-client speed. Run `python3 tools/test_camera_stream.py` on the laptop. It checks 120 consecutive JPEGs and reports time to first frame, received FPS, and JPEG throughput.
+4. Compare VGA and QVGA in the dashboard settings. QVGA uses less bandwidth. VGA gives the laptop AI more detail. Repeat the speed test after changing the resolution or JPEG quality.
+5. For a laptop AI preview on this hotspot, run `python3 tools/laptop_face_bridge.py --ip 192.168.11.1`. Flash `cam_face_stream_s3` when you are ready to reconnect the camera to the hub.
 
 ---
 

@@ -367,12 +367,17 @@ bool readBoolParam(const String &body, const char *argName, bool &outVal) {
   return !body.isEmpty() && jsonGetBool(body, argName, outVal);
 }
 
-// Core 0 camera capture & hardware JPEG streaming task (no local AI inference).
+// Capture on core 1 while core 0 sends the latest JPEG over Wi-Fi.
 void camCaptureTask(void * /*param*/) {
   StreamConfig capCfg;
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     capCfg = g_status.cfg;
     xSemaphoreGive(stateMutex);
+  }
+  const bool flashAvailable = camHwFlashAvailable();
+  if (!flashAvailable) {
+    capCfg.flashAuto = false;
+    capCfg.flashDuty = 0;
   }
 
   unsigned long streamFpsLastMs = millis();
@@ -419,6 +424,10 @@ void camCaptureTask(void * /*param*/) {
         if (nextCfg.jpegQuality != capCfg.jpegQuality && s->set_quality) {
           s->set_quality(s, nextCfg.jpegQuality);
         }
+      }
+      if (!flashAvailable) {
+        nextCfg.flashAuto = false;
+        nextCfg.flashDuty = 0;
       }
       capCfg = nextCfg;
       if (!capCfg.flashAuto) {
@@ -577,7 +586,7 @@ void camCaptureTask(void * /*param*/) {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(camHwHasStreamClients() ? 4 : 16));
+    vTaskDelay(camHwHasStreamClients() ? 1 : pdMS_TO_TICKS(16));
   }
 }
 
@@ -982,7 +991,7 @@ void handleStatus() {
   json += "\"mode\":\"REMOTE_LAPTOP_AI\",";
   json += "\"cameraReady\":" + String(snap.cameraReady ? "true" : "false") + ",";
   json += "\"modelReady\":" + String(snap.laptopConnected ? "true" : "false") + ",";
-  json += "\"flashOk\":true,";
+  json += "\"flashOk\":" + String(camHwFlashAvailable() ? "true" : "false") + ",";
   json += "\"laptopConnected\":" + String(snap.laptopConnected ? "true" : "false") + ",";
   json += "\"laptopAgeMs\":" + String(snap.laptopAgeMs) + ",";
   json += "\"laptopModel\":\"" + smartHomeJsonEscape(snap.laptopModel) + "\",";
@@ -1381,7 +1390,7 @@ void handleRoot() {
       </div>
 
       <div class="player-box" id="player-container">
-        <img id="cam" alt="Camera Live Stream" src="/preview.jpg">
+        <img id="cam" alt="Camera Live Stream">
         <svg id="bbox-svg" class="bbox-overlay" viewBox="0 0 640 480" preserveAspectRatio="none">
           <rect id="bbox-rect" x="0" y="0" width="0" height="0" fill="none" stroke="#10b981" stroke-width="4" rx="6" style="display:none"/>
         </svg>
@@ -1408,16 +1417,16 @@ void handleRoot() {
       </div>
 
       <div class="row">
-        <span>Flash LED Brightness</span>
+        <span id="flash-label">Flash LED Brightness</span>
         <div style="display:flex;align-items:center;gap:8px;width:55%">
-          <input id="flash-slider" type="range" min="0" max="180" value="0" style="flex:1" oninput="updateFlashPreview(this.value)">
+          <input id="flash-slider" type="range" min="0" max="180" value="0" style="flex:1" oninput="updateFlashPreview(this.value)" disabled>
           <span id="flash-val" style="font-size:.8rem;width:28px;text-align:right">0</span>
         </div>
       </div>
 
       <div class="row">
         <span>Auto Flash (Darkness + Motion, 5s Off)</span>
-        <label class="switch"><input id="cfg-flash-auto" type="checkbox"><span class="slider"></span></label>
+        <label class="switch"><input id="cfg-flash-auto" type="checkbox" disabled><span class="slider"></span></label>
       </div>
 
       <div class="row">
@@ -1750,6 +1759,9 @@ async function refreshStatus() {
     }
 
     renderFaceTable(d.enrolled || [], d.lastMatchId);
+    document.getElementById('flash-label').textContent = d.flashOk ? 'Flash LED Brightness' : 'Flash output unavailable';
+    document.getElementById('flash-slider').disabled = !d.flashOk;
+    document.getElementById('cfg-flash-auto').disabled = !d.flashOk;
 
     if (!cfgLoaded && d.cfg) {
       cfgLoaded = true;
@@ -1940,7 +1952,7 @@ void setup() {
                             nullptr,
                             1,
                             nullptr,
-                            0);
+                            1);
     Serial.println("[STREAM] Capture task + MJPEG stream ready.");
   }
 }
