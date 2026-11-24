@@ -29,6 +29,11 @@ import dlib
 import face_recognition
 import numpy as np
 
+if __package__:
+    from .camera_stream import RESOLUTIONS, iter_jpegs, set_video_config
+else:
+    from camera_stream import RESOLUTIONS, iter_jpegs, set_video_config
+
 
 class EspCamStreamClient:
     """HTTP control & MJPEG stream client for the cam_face_stream ESP32-CAM node."""
@@ -103,26 +108,10 @@ class EspCamStreamClient:
         """Yield raw JPEG byte buffers from the ESP32-CAM multipart MJPEG stream."""
         req = urllib.request.Request(self.stream_url)
         with self._opener.open(req, timeout=timeout) as resp:
-            buf = bytearray()
-            while True:
-                chunk = resp.read1(8192)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                while True:
-                    soi = buf.find(b"\xff\xd8")
-                    if soi < 0:
-                        if len(buf) > 65536:
-                            del buf[:-2]
-                        break
-                    eoi = buf.find(b"\xff\xd9", soi + 2)
-                    if eoi < 0:
-                        if soi > 0:
-                            del buf[:soi]
-                        break
-                    jpg = bytes(buf[soi : eoi + 2])
-                    del buf[: eoi + 2]
-                    yield jpg
+            yield from iter_jpegs(resp)
+
+    def configure_video(self, resolution=None, quality=None):
+        set_video_config(self._opener, self.base_url, resolution, quality)
 
 
 class FastFaceEngine:
@@ -629,14 +618,23 @@ def main():
     parser.add_argument("--ip", help="Override the camera IP (hub mode defaults to 192.168.4.101)")
     parser.add_argument("--http-port", type=int, default=80, help="ESP32-CAM HTTP control port (default: 80)")
     parser.add_argument("--stream-port", type=int, default=81, help="ESP32-CAM MJPEG stream port (default: 81)")
+    parser.add_argument("--resolution", choices=RESOLUTIONS, help="Set the camera resolution before streaming")
+    parser.add_argument("--jpeg-quality", type=int, metavar="8–30",
+                        help="Set JPEG compression. Higher numbers send smaller frames")
     parser.add_argument("--faces-dir", default=os.path.join(os.path.dirname(__file__), "known_faces"),
                         help="Directory containing <Name>.jpg photos of authorized persons")
     parser.add_argument("--thresh", type=float, default=0.58,
                         help="Euclidean face distance threshold (default: 0.58, lower=stricter)")
     parser.add_argument("--no-gui", action="store_true", help="Run in headless background mode without OpenCV window")
     args = parser.parse_args()
+    if args.jpeg_quality is not None and not 8 <= args.jpeg_quality <= 30:
+        parser.error("--jpeg-quality must be between 8 and 30")
 
     client = EspCamStreamClient(args.ip, args.http_port, args.stream_port, standalone=args.standalone)
+    try:
+        client.configure_video(args.resolution, args.jpeg_quality)
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"Camera configuration failed: {exc}\n")
     engine = FastFaceEngine(args.faces_dir, distance_thresh=args.thresh)
     bridge = LaptopFaceBridge(client, engine, show_gui=not args.no_gui)
 

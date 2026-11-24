@@ -1,0 +1,59 @@
+"""HTTP video settings and multipart JPEG framing shared by the laptop tools."""
+
+import http.client
+import json
+import time
+import urllib.parse
+import urllib.request
+
+RESOLUTIONS = {"qvga": 0, "hvga": 1, "vga": 2}
+RESOLUTION_DIMENSIONS = ((320, 240), (480, 320), (640, 480))
+
+
+def set_video_config(opener, base_url, resolution=None, quality=None):
+    params = {}
+    if resolution is not None:
+        params["res"] = RESOLUTIONS[resolution]
+    if quality is not None:
+        params["qual"] = quality
+    if params:
+        query = urllib.parse.urlencode(params)
+        request = urllib.request.Request(f"{base_url}/api/config?{query}", method="POST")
+        with opener.open(request, timeout=3) as response:
+            if not json.load(response).get("ok"):
+                raise ValueError("camera rejected the video settings")
+    if resolution is not None:
+        expected = RESOLUTION_DIMENSIONS[RESOLUTIONS[resolution]]
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            with opener.open(f"{base_url}/api/status", timeout=2) as response:
+                status = json.load(response)
+            dimensions = status.get("frameWidth"), status.get("frameHeight")
+            if status.get("cameraReady") and dimensions == expected:
+                return
+            time.sleep(0.15)
+        raise ValueError(f"camera did not report {expected[0]}×{expected[1]} frames")
+
+
+def iter_jpegs(response):
+    boundary = response.headers.get_param("boundary")
+    if response.headers.get_content_type() != "multipart/x-mixed-replace" or not boundary:
+        raise ValueError("expected a multipart MJPEG stream")
+    boundary = boundary.encode("ascii")
+    delimiter = b"--" + boundary
+    while True:
+        line = response.readline(256).rstrip(b"\r\n")
+        if not line or line == delimiter + b"--":
+            return
+        # Older camera builds included the delimiter prefix in the header value.
+        if line != delimiter and not (boundary.startswith(b"--") and line == boundary):
+            raise ValueError("missing multipart frame boundary")
+        headers = http.client.parse_headers(response)
+        size = int(headers.get("Content-Length", 0))
+        if headers.get_content_type() != "image/jpeg" or not 4 <= size <= 2**20:
+            raise ValueError("invalid JPEG part headers")
+        jpeg = response.read(size)
+        if (len(jpeg) != size or jpeg[:2] != b"\xff\xd8" or jpeg[-2:] != b"\xff\xd9"
+                or response.read(2) != b"\r\n"):
+            raise ValueError("incomplete JPEG part")
+        yield jpeg

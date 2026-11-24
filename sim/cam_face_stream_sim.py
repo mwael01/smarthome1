@@ -11,7 +11,6 @@ Simulates the temporary offloaded-AI camera firmware:
 import argparse
 import io
 import json
-import os
 import socket
 import struct
 import threading
@@ -36,25 +35,6 @@ ENROLL_TIMEOUT_S = 12.0
 LAPTOP_LINK_TIMEOUT_S = 5.0
 
 
-def load_firmware_dashboard_html(stream_port: int) -> bytes:
-    """Load the exact Web Dashboard HTML from src/cam_face_stream/main.cpp."""
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cpp_path = os.path.join(repo_root, "src", "cam_face_stream", "main.cpp")
-    with open(cpp_path, "r", encoding="utf-8") as f:
-        src = f.read()
-    start_marker = 'R"HTML('
-    end_marker = ')HTML"'
-    s_idx = src.find(start_marker)
-    e_idx = src.find(end_marker, s_idx + len(start_marker))
-    if s_idx < 0 or e_idx < 0:
-        return b"<html><body>Dashboard missing</body></html>"
-    html = src[s_idx + len(start_marker) : e_idx]
-    if stream_port != 81:
-        html = html.replace("':81/stream'", f"':{stream_port}/stream'")
-        html = html.replace("STREAMING :81", f"STREAMING :{stream_port}")
-    return html.encode("utf-8")
-
-
 class StreamCamState:
     def __init__(self, stream_port: int = 8082):
         self.lock = threading.Lock()
@@ -67,8 +47,8 @@ class StreamCamState:
         self.motion_detected = False
         self.face_quality = "NO_FACE"
         self.face_box = [0, 0, 0, 0]
-        self.frame_width = 640
-        self.frame_height = 480
+        self.frame_width = 320
+        self.frame_height = 240
         self.enroll_pending = False
         self.enroll_start_ms = 0.0
         self.enroll_target_name = ""
@@ -94,8 +74,8 @@ class StreamCamState:
             "flashAuto": True,
             "hmirror": False,
             "vflip": False,
-            "frameRes": 2,
-            "jpegQuality": 12,
+            "frameRes": 0,
+            "jpegQuality": 16,
         }
         self.unknown_streak = 0
         self.last_recognized_sent = 0.0
@@ -103,7 +83,6 @@ class StreamCamState:
         self.seq = 0
         self.latest_jpeg = b""
         self.new_frame_event = threading.Event()
-        self.dashboard_html = load_firmware_dashboard_html(stream_port)
 
     def send_dual_path_event(self, event_type: int, match_id: int, conf: int, label: str) -> bool:
         self.seq += 1
@@ -232,14 +211,6 @@ def make_http_handler(cam: StreamCamState):
             path = parsed.path
             qs = parse_qs(parsed.query)
 
-            if path == "/":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.send_header("Content-Length", str(len(cam.dashboard_html)))
-                self.end_headers()
-                self.wfile.write(cam.dashboard_html)
-                return
-
             if path == "/preview.jpg":
                 with cam.lock:
                     jpg = cam.latest_jpeg
@@ -254,7 +225,7 @@ def make_http_handler(cam: StreamCamState):
                 self.wfile.write(jpg)
                 return
 
-            if path == "/stream":
+            if path in ("/", "/stream"):
                 host = self.headers.get("Host", "127.0.0.1").split(":")[0]
                 self.send_response(302)
                 self.send_header("Location", f"http://{host}:{cam.stream_port}/stream")

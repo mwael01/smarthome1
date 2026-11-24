@@ -91,12 +91,12 @@ def run_tests():
         # Scenario 1: Dashboard HTML, Clean Stream, & Hub Proxy
         # -------------------------------------------------------------------
         print("\n--- [Scenario 1: Dashboard & Clean Raw MJPEG Stream] ---")
-        st, html_bytes = http_get(f"{CAM_URL}/")
-        html = html_bytes.decode("utf-8", errors="ignore")
-        log_test(
-            "Dashboard serves Camera 1 Stream + Laptop AI UI",
-            st == 200 and "laptop-badge" in html and "/api/recognition/result" in html and "bbox-svg" in html,
-        )
+        with urllib.request.urlopen(f"{CAM_URL}/", timeout=3) as preview_response:
+            log_test(
+                "Camera root opens the raw MJPEG stream",
+                preview_response.geturl().endswith(":8082/stream")
+                and preview_response.headers.get_content_type() == "multipart/x-mixed-replace",
+            )
 
         # Read real MJPEG frames through EspCamStreamClient
         got_frames = []
@@ -270,12 +270,18 @@ def run_tests():
             st == 200 and cam_st["pendingAction"] == "none" and not any(e["id"] == 1 for e in cam_st["enrolled"]),
         )
 
-        http_post(f"{CAM_URL}/api/config?res=1&qual=15")
+        client.configure_video("hvga", 15)
         cam_st = client.get_status()
         log_test(
             "Config resolution HVGA updated frameWidth=480, frameHeight=320",
             cam_st["frameWidth"] == 480 and cam_st["frameHeight"] == 320 and cam_st["cfg"]["jpegQuality"] == 15,
         )
+
+        client.configure_video("qvga", 18)
+        cam_st = client.get_status()
+        log_test("Laptop can select the lower-bandwidth QVGA preset",
+                 cam_st["frameWidth"] == 320 and cam_st["frameHeight"] == 240
+                 and cam_st["cfg"]["jpegQuality"] == 18)
 
         hub_proc.terminate()
         hub_proc.wait()

@@ -20,7 +20,6 @@ constexpr int FLASH_LEDC_CHANNEL = 2; // Avoid LEDC channel 0 used by camera XCL
 constexpr int MAX_STREAM_CLIENTS = 4;
 constexpr size_t PART_HEADER_RESERVE = 96;
 constexpr size_t PART_TRAILER_RESERVE = 2;
-constexpr size_t TCP_SEND_CHUNK_BYTES = 2872; // 2x TCP MSS (fits inside 5744B lwIP TCP_SND_BUF)
 constexpr unsigned long FRAME_SEND_TIMEOUT_MS = 250;
 constexpr unsigned long FRAME_IDLE_TIMEOUT_MS = 3000;
 
@@ -58,11 +57,7 @@ bool sendPacketAll(int fd, const uint8_t *buf, size_t len) {
   const unsigned long startMs = millis();
   while (sent < len) {
     if (millis() - startMs >= FRAME_SEND_TIMEOUT_MS) return false;
-    size_t chunk = len - sent;
-    if (chunk > TCP_SEND_CHUNK_BYTES) {
-      chunk = TCP_SEND_CHUNK_BYTES;
-    }
-    ssize_t n = lwip_send(fd, buf + sent, chunk, 0);
+    ssize_t n = lwip_send(fd, buf + sent, len - sent, 0);
     if (n > 0) {
       sent += static_cast<size_t>(n);
     } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -290,13 +285,16 @@ bool camHwInitCamera(pixformat_t pixelFormat,
   // Avoids the asymmetric LEDC odd-divider clock at 16 MHz that causes RGB565 pixel color corruption.
   config.xclk_freq_hz = 20000000;
   config.pixel_format = pixelFormat;
-  config.frame_size = frameSize;
+  const bool hasPsram = psramFound();
+  // Reserve enough DMA buffer space for all advertised presets. The sensor
+  // switches to the selected size before the application publishes frames.
+  config.frame_size = hasPsram ? FRAMESIZE_VGA : frameSize;
   config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.fb_location = hasPsram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.jpeg_quality = jpegQuality;
   // Triple buffering keeps capture DMA fed while the stream task transmits the
   // previous frame. This is especially important on the S3 camera with PSRAM.
-  config.fb_count = psramFound() ? 3 : 1;
+  config.fb_count = hasPsram ? 3 : 1;
 
   // Always execute esp_camera_init on Core 0 (PRO_CPU) so esp_intr_alloc binds
   // ll_cam_vsync_isr and ll_cam_dma_isr to Core 0 instead of Core 1 (AI core).
@@ -329,10 +327,10 @@ bool camHwInitCamera(pixformat_t pixelFormat,
     if (config.frame_size > FRAMESIZE_VGA) {
       config.frame_size = FRAMESIZE_VGA;
     }
-    if (!psramFound() && config.frame_size > FRAMESIZE_QVGA) {
+    if (!hasPsram && config.frame_size > FRAMESIZE_QVGA) {
       config.frame_size = FRAMESIZE_QVGA;
     }
-    config.fb_count = psramFound() ? 3 : 1;
+    config.fb_count = hasPsram ? 3 : 1;
 
     if (xPortGetCoreID() == 0) {
       err = esp_camera_init(&config);
@@ -362,6 +360,10 @@ bool camHwInitCamera(pixformat_t pixelFormat,
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
+    if (frameSize != config.frame_size && (!s->set_framesize || s->set_framesize(s, frameSize) != 0)) {
+      Serial.println("[CAM_HW] Failed to apply startup resolution");
+      return false;
+    }
     Serial.printf("[CAM_HW] Sensor initialized: PID 0x%02X, pixel_format=%s\n",
                   s->id.PID,
                   config.pixel_format == PIXFORMAT_JPEG ? "Hardware JPEG" : "RGB565 (Software JPEG)");

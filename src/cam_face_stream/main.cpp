@@ -2,7 +2,7 @@
 // Focuses exclusively on:
 //   1. Real-time hardware MJPEG live video streaming (:81/stream & /preview.jpg)
 //   2. Darkness + Motion Auto-Flash (5-second auto-off)
-//   3. Hosting a live management Web Dashboard + REST Feedback API (/api/recognition/result)
+//   3. Accepting laptop recognition feedback (/api/recognition/result)
 //   4. Forwarding Laptop recognition/intruder verdicts to the Main Hub via ESP-NOW + HTTP
 //
 // Face detection & MobileFaceNet recognition run on the companion Laptop Analyzer instead
@@ -57,8 +57,8 @@ struct StreamConfig {
   bool flashAuto = true;
   bool hmirror = false;
   bool vflip = false;
-  uint8_t frameRes = 2;
-  uint8_t jpegQuality = 12;
+  uint8_t frameRes = 0;
+  uint8_t jpegQuality = 16;
 };
 
 struct StreamStatusSnapshot {
@@ -99,8 +99,6 @@ WebServer server(80);
 SemaphoreHandle_t stateMutex = nullptr;
 
 StreamStatusSnapshot g_status;
-StreamConfig g_pendingCfg;
-bool g_applyCfgPending = false;
 volatile bool g_sensorCfgPending = false;
 
 volatile bool g_enrollPending = false;
@@ -152,8 +150,8 @@ void loadConfigFromNvs(StreamConfig &cfg) {
   cfg.flashAuto = prefs.getBool("flash_auto", true);
   cfg.hmirror = prefs.getBool("hmir", false);
   cfg.vflip = prefs.getBool("vflip", false);
-  cfg.frameRes = static_cast<uint8_t>(constrain(prefs.getUChar("res", 2), 0, 2));
-  cfg.jpegQuality = static_cast<uint8_t>(constrain(prefs.getUChar("qual", 12), 8, 30));
+  cfg.frameRes = static_cast<uint8_t>(constrain(prefs.getUChar("res", cfg.frameRes), 0, 2));
+  cfg.jpegQuality = static_cast<uint8_t>(constrain(prefs.getUChar("qual", cfg.jpegQuality), 8, 30));
   prefs.end();
 }
 
@@ -385,7 +383,7 @@ void camCaptureTask(void * /*param*/) {
   unsigned long lastActivityMs = 0;
   unsigned long flashSettleUntilMs = 0;
   uint32_t streamFrames = 0;
-  uint32_t frameLoopCounter = 0;
+  unsigned int framesToDiscard = 0;
   float sceneLuma = 0.35f;
   bool motionRecent = false;
   bool flashOn = false;
@@ -411,13 +409,12 @@ void camCaptureTask(void * /*param*/) {
           s->set_vflip(s, nextCfg.vflip ? 1 : 0);
         }
         if (nextCfg.frameRes != capCfg.frameRes && s->set_framesize) {
-          s->set_framesize(s, toFrameSize(nextCfg.frameRes));
-          int rw = 640, rh = 480;
-          resolutionDims(nextCfg.frameRes, rw, rh);
-          if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            g_status.frameWidth = rw;
-            g_status.frameHeight = rh;
-            xSemaphoreGive(stateMutex);
+          if (s->set_framesize(s, toFrameSize(nextCfg.frameRes)) == 0) {
+            // The DMA queue may still contain frames captured at the old size.
+            framesToDiscard = 3;
+          } else {
+            Serial.println("[STREAM] Sensor rejected resolution change");
+            nextCfg.frameRes = capCfg.frameRes;
           }
         }
         if (nextCfg.jpegQuality != capCfg.jpegQuality && s->set_quality) {
@@ -440,6 +437,12 @@ void camCaptureTask(void * /*param*/) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       vTaskDelay(pdMS_TO_TICKS(8));
+      continue;
+    }
+
+    if (framesToDiscard > 0) {
+      --framesToDiscard;
+      esp_camera_fb_return(fb);
       continue;
     }
 
@@ -473,8 +476,7 @@ void camCaptureTask(void * /*param*/) {
 
       // 2. Periodically snapshot the compressed JPEG (~18KB) to analyze luma/motion AFTER releasing DMA
       size_t motionCopyLen = 0;
-      bool shouldSampleMotion = (g_motionJpgBuf != nullptr) &&
-                                ((frameLoopCounter++ % 3U) == 0U) &&
+      bool shouldSampleMotion = capCfg.flashAuto && g_motionJpgBuf &&
                                 (now - lastMotionSampleMs >= 110UL) &&
                                 (fb->len <= MAX_MOTION_JPG_BUF);
       if (shouldSampleMotion) {
@@ -504,7 +506,7 @@ void camCaptureTask(void * /*param*/) {
     } else {
       // For sensors without hardware JPEG (e.g. OV7670 / GC0308):
       // Analyze luma/motion directly on raw RGB565 pixels (<0.2 ms)
-      bool shouldSampleMotion = ((frameLoopCounter++ % 3U) == 0U) &&
+      bool shouldSampleMotion = capCfg.flashAuto &&
                                 (now - lastMotionSampleMs >= 110UL);
       if (shouldSampleMotion) {
         sceneLuma = camHwAnalyzeSceneLumaAndMotion(fb,
@@ -1146,7 +1148,7 @@ void handleClear() {
 
 void handleConfig() {
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    StreamConfig next = g_applyCfgPending ? g_pendingCfg : g_status.cfg;
+    StreamConfig next = g_status.cfg;
     if (server.hasArg("armed")) next.armed = (server.arg("armed").toInt() != 0);
     if (server.hasArg("uconf")) next.unknownConfirm = constrain(server.arg("uconf").toInt(), 1, 5);
     if (server.hasArg("flash")) next.flashDuty = static_cast<uint8_t>(constrain(server.arg("flash").toInt(), 0, 180));
@@ -1155,9 +1157,12 @@ void handleConfig() {
     if (server.hasArg("vflip")) next.vflip = (server.arg("vflip").toInt() != 0);
     if (server.hasArg("res")) next.frameRes = static_cast<uint8_t>(constrain(server.arg("res").toInt(), 0, 2));
     if (server.hasArg("qual")) next.jpegQuality = static_cast<uint8_t>(constrain(server.arg("qual").toInt(), 8, 30));
-    g_pendingCfg = next;
+    if (next.frameRes > 0 && !psramFound()) {
+      xSemaphoreGive(stateMutex);
+      server.send(409, "application/json", "{\"error\":\"Higher resolutions require PSRAM\"}");
+      return;
+    }
     g_status.cfg = next;
-    g_applyCfgPending = true;
     g_sensorCfgPending = true;
     xSemaphoreGive(stateMutex);
     saveConfigToNvs(next);
@@ -1178,706 +1183,13 @@ void handlePreview() {
   camHwHandlePreviewRequest(server);
 }
 
-void handleRoot() {
-  static const char HTML[] PROGMEM = R"HTML(<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>Smart Camera 1 — High-FPS Stream &amp; Laptop AI</title>
-<style>
-  :root {
-    --bg: #090d16;
-    --card: #131c2e;
-    --card-border: #23324d;
-    --card-hover: #19263e;
-    --text: #f1f5f9;
-    --text-muted: #94a3b8;
-    --primary: #3b82f6;
-    --primary-hover: #2563eb;
-    --success: #10b981;
-    --danger: #ef4444;
-    --warning: #f59e0b;
-    --cyan: #06b6d4;
-    --radius: 12px;
-  }
-  * { box-sizing: border-box; }
-  body {
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    margin: 0;
-    padding: 16px;
-    line-height: 1.45;
-  }
-  .wrap { max-width: 1060px; margin: 0 auto; }
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-bottom: 16px;
-    padding-bottom: 12px;
-    border-bottom: 1px solid var(--card-border);
-  }
-  h1 { font-size: 1.2rem; font-weight: 700; margin: 0; display: flex; align-items: center; gap: 8px; }
-  .pulse-dot {
-    width: 10px; height: 10px; border-radius: 50%; background: var(--cyan);
-    box-shadow: 0 0 10px var(--cyan); animation: pulse 1.8s infinite;
-  }
-  @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.85); } }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
-  .card {
-    background: var(--card);
-    border: 1px solid var(--card-border);
-    border-radius: var(--radius);
-    padding: 16px;
-    box-shadow: 0 4px 14px rgba(0,0,0,.35);
-  }
-  .card-title {
-    font-size: .95rem; font-weight: 700; color: #cbd5e1;
-    margin: 0 0 12px; display: flex; justify-content: space-between; align-items: center;
-  }
-  .player-box {
-    position: relative;
-    width: 100%;
-    max-width: 480px;
-    margin: 0 auto 12px;
-    border-radius: var(--radius);
-    overflow: hidden;
-    background: #020617;
-    border: 1px solid var(--card-border);
-    aspect-ratio: 4 / 3;
-    box-shadow: 0 8px 24px rgba(0,0,0,.5);
-  }
-  .player-box img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-    background: #000;
-  }
-  .bbox-overlay {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none;
-  }
-  .reticle {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: 44%;
-    height: 70%;
-    border-radius: 50% / 60%;
-    border: 2px dashed rgba(148, 163, 184, 0.35);
-    pointer-events: none;
-    transition: all .25s ease;
-  }
-  .reticle.enrolling {
-    border: 3px solid var(--cyan);
-    box-shadow: 0 0 18px rgba(6, 182, 212, 0.45);
-    animation: reticlePulse 1.2s infinite ease-in-out;
-  }
-  .reticle.recognized { border: 3px solid var(--success); box-shadow: 0 0 18px rgba(16, 185, 129, 0.45); }
-  .reticle.unknown { border: 3px solid var(--danger); box-shadow: 0 0 18px rgba(239, 68, 68, 0.45); }
-  @keyframes reticlePulse {
-    0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
-    50% { transform: translate(-50%, -50%) scale(1.04); opacity: .7; }
-  }
-  .hud-top {
-    position: absolute; top: 10px; left: 10px; right: 10px;
-    display: flex; justify-content: space-between; pointer-events: none;
-  }
-  .hud-pill {
-    background: rgba(15, 23, 42, 0.85);
-    backdrop-filter: blur(6px);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 999px;
-    padding: 3px 9px;
-    font-size: .75rem;
-    font-weight: 700;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .hud-bottom {
-    position: absolute; bottom: 0; left: 0; right: 0;
-    background: linear-gradient(to top, rgba(2, 6, 23, 0.95), rgba(2, 6, 23, 0));
-    padding: 24px 12px 10px;
-    display: flex; justify-content: space-between; align-items: flex-end; pointer-events: none;
-  }
-  .hud-banner-title { font-size: .92rem; font-weight: 700; }
-  .hud-banner-sub { font-size: .75rem; color: var(--text-muted); }
-
-  button {
-    background: var(--primary); color: #fff; border: 0; border-radius: 8px;
-    padding: 8px 14px; font-size: .88rem; font-weight: 600; cursor: pointer;
-    transition: all .15s ease; display: inline-flex; align-items: center; gap: 6px;
-  }
-  button:hover { background: var(--primary-hover); transform: translateY(-1px); }
-  button.danger { background: var(--danger); }
-  button.danger:hover { background: #dc2626; }
-  button.success { background: var(--success); }
-  button.success:hover { background: #059669; }
-  button.outline { background: transparent; border: 1px solid var(--card-border); color: var(--text-muted); }
-  button.outline:hover { background: var(--card-hover); color: var(--text); }
-  button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
-
-  input[type="text"], input[type="number"], select {
-    background: #0b1322; color: var(--text); border: 1px solid var(--card-border);
-    border-radius: 8px; padding: 8px 12px; font-size: .9rem; width: 100%; outline: none;
-  }
-  .row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 7px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: .88rem;
-  }
-  .row:last-child { border-bottom: 0; }
-  .badge {
-    padding: 2px 8px; border-radius: 999px; font-size: .74rem; font-weight: 700; letter-spacing: .3px;
-  }
-  .badge.ok { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.35); }
-  .badge.bad { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.35); }
-  .badge.warn { background: rgba(245, 158, 11, 0.2); color: #fde68a; border: 1px solid rgba(245, 158, 11, 0.35); }
-  .badge.info { background: rgba(6, 182, 212, 0.2); color: #a5f3fc; border: 1px solid rgba(6, 182, 212, 0.35); }
-  .badge.off { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
-
-  .progress-wrap {
-    height: 8px; background: #0b1322; border-radius: 999px; overflow: hidden;
-    margin: 8px 0; display: none; border: 1px solid var(--card-border);
-  }
-  .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--primary)); }
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: .88rem; }
-  th, td { padding: 8px; text-align: left; border-bottom: 1px solid var(--card-border); }
-  th { color: var(--text-muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; }
-
-  .switch { position: relative; display: inline-block; width: 42px; height: 22px; }
-  .switch input { opacity: 0; width: 0; height: 0; }
-  .slider {
-    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-    background-color: #334155; transition: .2s; border-radius: 22px;
-  }
-  .slider:before {
-    position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px;
-    background-color: white; transition: .2s; border-radius: 50%;
-  }
-  input:checked + .slider { background-color: var(--primary); }
-  input:checked + .slider:before { transform: translateX(20px); }
-
-  .api-box {
-    background: #0b1322; border: 1px solid var(--card-border); border-radius: 8px;
-    padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: .76rem; color: #93c5fd; margin-top: 10px; line-height: 1.55; word-break: break-all;
-  }
-  #toast {
-    position: fixed; bottom: 20px; right: 20px; background: #1e293b; border: 1px solid var(--card-border);
-    color: #fff; padding: 10px 18px; border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.5);
-    transform: translateY(100px); opacity: 0; transition: all .25s ease; z-index: 999; font-size: .88rem;
-  }
-  #toast.show { transform: translateY(0); opacity: 1; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <h1><span class="pulse-dot"></span> Camera 1 — Clean Stream + Laptop AI</h1>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span id="laptop-badge" class="badge warn">LAPTOP AI: WAITING</span>
-      <span id="hub-badge" class="badge off">CHECKING HUB</span>
-      <span id="fps-badge" class="badge info">0.0 FPS</span>
-    </div>
-  </header>
-
-  <div class="grid">
-    <div class="card">
-      <div class="card-title">
-        <span>Clean Raw Camera Feed</span>
-        <button class="outline" style="padding:4px 8px;font-size:.78rem" onclick="toggleStreamMode()" id="stream-mode-btn">Mode: MJPEG</button>
-      </div>
-
-      <div class="player-box" id="player-container">
-        <img id="cam" alt="Camera Live Stream">
-        <svg id="bbox-svg" class="bbox-overlay" viewBox="0 0 640 480" preserveAspectRatio="none">
-          <rect id="bbox-rect" x="0" y="0" width="0" height="0" fill="none" stroke="#10b981" stroke-width="4" rx="6" style="display:none"/>
-        </svg>
-        <div id="reticle" class="reticle"></div>
-
-        <div class="hud-top">
-          <div class="hud-pill">
-            <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--cyan)"></span>
-            <span id="hud-stream-text">STREAMING :81</span>
-          </div>
-          <div class="hud-pill badge off" id="hud-quality-pill">NO FACE</div>
-        </div>
-
-        <div class="hud-bottom">
-          <div>
-            <div class="hud-banner-title" id="hud-name">---</div>
-            <div class="hud-banner-sub" id="hud-guide">Waiting for Laptop analyzer feedback</div>
-          </div>
-          <div style="text-align:right">
-            <div id="hud-match-score" style="font-weight:700;font-size:1.1rem;color:#fff">0%</div>
-            <div style="font-size:.72rem;color:var(--text-muted)" id="hud-ms">0 ms</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="row">
-        <span id="flash-label">Flash LED Brightness</span>
-        <div style="display:flex;align-items:center;gap:8px;width:55%">
-          <input id="flash-slider" type="range" min="0" max="180" value="0" style="flex:1" oninput="updateFlashPreview(this.value)" disabled>
-          <span id="flash-val" style="font-size:.8rem;width:28px;text-align:right">0</span>
-        </div>
-      </div>
-
-      <div class="row">
-        <span>Auto Flash (Darkness + Motion, 5s Off)</span>
-        <label class="switch"><input id="cfg-flash-auto" type="checkbox" disabled><span class="slider"></span></label>
-      </div>
-
-      <div class="row">
-        <span>Pipeline Telemetry</span>
-        <span id="status-storage-info" style="font-size:.8rem;color:var(--text-muted)">Offloaded AI | 0 updates</span>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
-        <button class="success" id="test-door" onclick="testDoor(1)" style="justify-content:center" disabled>Test Door Open</button>
-        <button class="danger" id="test-siren" onclick="testDoor(0)" style="justify-content:center" disabled>Test Intruder Siren</button>
-      </div>
-
-      <div class="api-box">
-        <div><strong>Stream URL:</strong> <span id="api-stream-url">-</span></div>
-        <div><strong>Feedback API:</strong> POST <span id="api-fb-url">-</span></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        <span>Remote Laptop Face Enrollment</span>
-        <span id="face-count-badge" class="badge off">0 Enrolled</span>
-      </div>
-
-      <div style="margin-bottom:12px">
-        <label style="font-size:.82rem;color:var(--text-muted);display:block;margin-bottom:4px">Person Name (Captured by Laptop)</label>
-        <div style="display:flex;gap:8px">
-          <input id="ename" type="text" maxlength="20" placeholder="e.g. Alice, Khaled" value="User">
-          <button id="enroll-btn" onclick="startEnrollment()" style="white-space:nowrap">Enroll Face</button>
-          <button id="cancel-btn" class="danger" onclick="cancelEnrollment()" style="display:none;white-space:nowrap">Cancel</button>
-        </div>
-      </div>
-
-      <div class="progress-wrap" id="prog-wrap">
-        <div class="progress-bar" id="prog-bar"></div>
-      </div>
-
-      <div style="background:#0b1322;border:1px solid var(--card-border);border-radius:8px;padding:9px 12px;font-size:.84rem;color:#93c5fd;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center">
-        <span id="enroll-msg">Idle: Ready for Laptop enrollment</span>
-        <span id="enroll-timer" style="font-weight:700"></span>
-      </div>
-
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">
-        <span style="font-weight:700;font-size:.9rem">Enrolled Faces (Laptop Directory)</span>
-        <button class="outline danger" style="padding:4px 8px;font-size:.78rem" onclick="clearAllFaces()">Clear All</button>
-      </div>
-
-      <div style="max-height:200px;overflow-y:auto;margin-top:6px">
-        <table>
-          <thead><tr><th>ID</th><th>Name</th><th style="text-align:right">Action</th></tr></thead>
-          <tbody id="face-table-body">
-            <tr><td colspan="3" style="text-align:center;color:var(--text-muted)">Waiting for Laptop face list sync...</td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <hr style="border:0;border-top:1px solid var(--card-border);margin:16px 0 12px">
-
-      <div class="card-title" style="margin-bottom:8px">
-        <span>Stream &amp; Security Settings</span>
-      </div>
-
-      <div class="row">
-        <span>Intruder Siren Armed</span>
-        <label class="switch"><input id="cfg-armed" type="checkbox"><span class="slider"></span></label>
-      </div>
-
-      <div class="row">
-        <span>Stream Resolution</span>
-        <select id="cfg-res" style="width:55%">
-          <option value="0">QVGA (320x240 - Max FPS)</option>
-          <option value="1">HVGA (480x320 - Balanced)</option>
-          <option value="2">VGA (640x480 - Best Detail)</option>
-        </select>
-      </div>
-
-      <div class="row">
-        <span>JPEG Quality (<span id="qual-val">12</span> = sharp)</span>
-        <div style="display:flex;align-items:center;gap:6px;width:55%">
-          <input id="cfg-qual" type="range" min="8" max="30" step="1" value="12" style="flex:1" oninput="document.getElementById('qual-val').textContent=this.value">
-        </div>
-      </div>
-
-      <div class="row">
-        <span>Confirm Frames (Unknown)</span>
-        <input id="cfg-uconf" type="number" min="1" max="5" value="2" style="width:65px">
-      </div>
-
-      <div class="row">
-        <span>Orientation</span>
-        <span>
-          <label style="margin-right:12px"><input id="cfg-hmir" type="checkbox"> Mirror H</label>
-          <label><input id="cfg-vflip" type="checkbox"> Flip V</label>
-        </span>
-      </div>
-
-      <div style="margin-top:10px">
-        <button onclick="saveSettings()" style="width:100%;justify-content:center">Save Settings to NVS</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div id="toast">Settings Saved</div>
-
-<script>
-let currentMode = 'mjpeg';
-let mjpegFails = 0;
-let snapshotActive = false;
-let mjpegRetryTimer = null;
-let cfgLoaded = false;
-let clientFrames = 0;
-let lastFpsTs = performance.now();
-let lastListSig = '';
-
-function showToast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2600);
-}
-
-function initCamera() {
-  const img = document.getElementById('cam');
-  const baseHost = window.location.protocol + '//' + window.location.hostname;
-  document.getElementById('api-stream-url').textContent = baseHost + ':81/stream';
-  document.getElementById('api-fb-url').textContent = baseHost + '/api/recognition/result';
-
-  img.onload = () => {
-    mjpegFails = 0;
-    clientFrames++;
-    const now = performance.now();
-    if (now - lastFpsTs >= 1000) {
-      const fps = Math.round((clientFrames * 1000) / (now - lastFpsTs) * 10) / 10;
-      document.getElementById('fps-badge').textContent = fps + ' FPS';
-      clientFrames = 0;
-      lastFpsTs = now;
-    }
-  };
-
-  img.onerror = () => {
-    if (currentMode === 'mjpeg') {
-      mjpegFails++;
-      if (mjpegFails <= 3) {
-        setTimeout(() => {
-          if (currentMode === 'mjpeg') {
-            img.src = baseHost + ':81/stream?t=' + Date.now();
-          }
-        }, 600);
-      } else {
-        setStreamMode('snapshot');
-        mjpegRetryTimer = setTimeout(() => setStreamMode('mjpeg'), 10000);
-      }
-    }
-  };
-
-  setStreamMode('mjpeg');
-}
-
-function setStreamMode(mode) {
-  clearTimeout(mjpegRetryTimer);
-  currentMode = mode;
-  const img = document.getElementById('cam');
-  const btn = document.getElementById('stream-mode-btn');
-  const pill = document.getElementById('hud-stream-text');
-  if (mode === 'mjpeg') {
-    mjpegFails = 0;
-    snapshotActive = false;
-    btn.textContent = 'Mode: MJPEG';
-    pill.textContent = 'STREAMING :81';
-    img.src = window.location.protocol + '//' + window.location.hostname + ':81/stream?t=' + Date.now();
-  } else {
-    btn.textContent = 'Mode: Snapshots';
-    pill.textContent = 'FAST SNAPSHOT';
-    snapshotActive = true;
-    pollNextSnapshot();
-  }
-}
-
-function toggleStreamMode() {
-  setStreamMode(currentMode === 'mjpeg' ? 'snapshot' : 'mjpeg');
-}
-
-function pollNextSnapshot() {
-  if (!snapshotActive || currentMode !== 'snapshot') return;
-  const img = document.getElementById('cam');
-  const next = new Image();
-  next.onload = () => {
-    if (snapshotActive) {
-      img.src = next.src;
-      requestAnimationFrame(pollNextSnapshot);
-    }
-  };
-  next.onerror = () => {
-    if (snapshotActive) setTimeout(pollNextSnapshot, 400);
-  };
-  next.src = '/preview.jpg?t=' + Date.now();
-}
-
-let flashTimer = null;
-function updateFlashPreview(val) {
-  document.getElementById('flash-val').textContent = val;
-  clearTimeout(flashTimer);
-  flashTimer = setTimeout(async () => {
-    const q = new URLSearchParams({ flash: val });
-    await fetch('/api/config?' + q.toString(), { method: 'POST' });
-  }, 120);
-}
-
-async function startEnrollment() {
-  const name = document.getElementById('ename').value.trim() || 'User';
-  document.getElementById('enroll-btn').disabled = true;
-  document.getElementById('cancel-btn').style.display = 'inline-flex';
-  document.getElementById('prog-wrap').style.display = 'block';
-  await fetch('/api/enroll?name=' + encodeURIComponent(name), { method: 'POST' });
-  refreshStatus();
-}
-
-async function cancelEnrollment() {
-  await fetch('/api/enroll/cancel', { method: 'POST' });
-  document.getElementById('enroll-btn').disabled = false;
-  document.getElementById('cancel-btn').style.display = 'none';
-  document.getElementById('prog-wrap').style.display = 'none';
-  refreshStatus();
-}
-
-async function refreshStatus() {
-  try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
-
-    const laptopBadge = document.getElementById('laptop-badge');
-    if (d.laptopConnected) {
-      laptopBadge.textContent = 'LAPTOP AI: ' + (d.laptopModel || 'ONLINE');
-      laptopBadge.className = 'badge ok';
-    } else {
-      laptopBadge.textContent = 'LAPTOP AI: WAITING';
-      laptopBadge.className = 'badge warn';
-    }
-
-    const hub = document.getElementById('hub-badge');
-    hub.textContent = d.hubConnected ? ('HUB: ' + d.ip) : (d.fallbackAp ? 'STANDALONE AP' : 'CONNECTING...');
-    hub.className = 'badge ' + (d.hubConnected ? 'ok' : 'warn');
-    document.getElementById('test-door').disabled = !d.hubConnected;
-    document.getElementById('test-siren').disabled = !d.hubConnected;
-
-    document.getElementById('status-storage-info').textContent =
-      (d.frameWidth || 640) + 'x' + (d.frameHeight || 480) + ' | ' + d.fps.toFixed(1) + ' FPS | ' + d.feedbackCount + ' Laptop events';
-    document.getElementById('face-count-badge').textContent = d.enrolledCount + ' Enrolled';
-
-    const reticle = document.getElementById('reticle');
-    const qPill = document.getElementById('hud-quality-pill');
-    const nameBanner = document.getElementById('hud-name');
-    const guideBanner = document.getElementById('hud-guide');
-    const scoreBanner = document.getElementById('hud-match-score');
-    document.getElementById('hud-ms').textContent = d.inferenceMs + ' ms';
-
-    // Keep player container aspect ratio synced to active resolution
-    const fw = d.frameWidth || 640;
-    const fh = d.frameHeight || 480;
-    const svg = document.getElementById('bbox-svg');
-    svg.setAttribute('viewBox', '0 0 ' + fw + ' ' + fh);
-    const rect = document.getElementById('bbox-rect');
-    const bx = d.faceBox || [0, 0, 0, 0];
-    if (d.faceDetected && bx[2] > bx[0] && bx[3] > bx[1]) {
-      rect.setAttribute('x', bx[0]);
-      rect.setAttribute('y', bx[1]);
-      rect.setAttribute('width', bx[2] - bx[0]);
-      rect.setAttribute('height', bx[3] - bx[1]);
-      rect.setAttribute('stroke', d.lastResult === 'RECOGNIZED' ? '#10b981' : (d.lastResult === 'UNKNOWN' ? '#ef4444' : '#f59e0b'));
-      rect.style.display = 'block';
-    } else {
-      rect.style.display = 'none';
-    }
-
-    if (!d.laptopConnected) {
-      qPill.textContent = 'LAPTOP OFFLINE';
-      qPill.className = 'hud-pill badge warn';
-      reticle.className = 'reticle';
-      guideBanner.textContent = 'Connect Laptop AI script to :81/stream';
-    } else if (!d.faceDetected) {
-      qPill.textContent = 'NO FACE';
-      qPill.className = 'hud-pill badge off';
-      reticle.className = 'reticle';
-      guideBanner.textContent = 'Stand in front of camera';
-    } else {
-      const qual = d.faceQuality || 'READY';
-      qPill.textContent = qual === 'READY' ? 'FACE CLEAR' : qual.replace('_', ' ');
-      qPill.className = 'hud-pill badge ' + (qual === 'READY' ? 'ok' : 'warn');
-      guideBanner.textContent = qual === 'READY' ? 'Analyzing via Laptop AI...' : 'Adjust position: ' + qual.replace('_', ' ');
-    }
-
-    if (d.enrollPending) {
-      reticle.className = 'reticle enrolling';
-      nameBanner.textContent = 'ENROLLING: ' + (d.enrollTargetName || 'User');
-      scoreBanner.textContent = 'CAPTURE';
-      scoreBanner.style.color = 'var(--cyan)';
-    } else if (d.lastResult === 'RECOGNIZED') {
-      reticle.className = 'reticle recognized';
-      nameBanner.textContent = d.lastMatchName;
-      scoreBanner.textContent = Math.round(d.lastSimilarity * 100) + '%';
-      scoreBanner.style.color = 'var(--success)';
-      guideBanner.textContent = 'Identity Verified (Laptop AI -> Hub)';
-    } else if (d.lastResult === 'UNKNOWN') {
-      reticle.className = 'reticle unknown';
-      nameBanner.textContent = 'UNKNOWN VISITOR';
-      scoreBanner.textContent = Math.round(d.lastSimilarity * 100) + '%';
-      scoreBanner.style.color = 'var(--danger)';
-      guideBanner.textContent = d.cfg.armed ? 'Intruder Alert Triggered' : 'Unregistered Face';
-    } else {
-      nameBanner.textContent = '---';
-      scoreBanner.textContent = '0%';
-      scoreBanner.style.color = '#fff';
-    }
-
-    const progWrap = document.getElementById('prog-wrap');
-    const progBar = document.getElementById('prog-bar');
-    const enrollBtn = document.getElementById('enroll-btn');
-    const cancelBtn = document.getElementById('cancel-btn');
-    const timerText = document.getElementById('enroll-timer');
-    const msgText = document.getElementById('enroll-msg');
-
-    if (d.enrollPending) {
-      progWrap.style.display = 'block';
-      enrollBtn.disabled = true;
-      cancelBtn.style.display = 'inline-flex';
-      progBar.style.width = Math.max(0, Math.min(100, Math.round((d.enrollRemainingMs / 12000) * 100))) + '%';
-      timerText.textContent = Math.ceil(d.enrollRemainingMs / 1000) + 's';
-      msgText.textContent = d.enrollMessage;
-    } else {
-      progWrap.style.display = 'none';
-      enrollBtn.disabled = false;
-      cancelBtn.style.display = 'none';
-      timerText.textContent = '';
-      msgText.textContent = d.enrollMessage;
-    }
-
-    renderFaceTable(d.enrolled || [], d.lastMatchId);
-    document.getElementById('flash-label').textContent = d.flashOk ? 'Flash LED Brightness' : 'Flash output unavailable';
-    document.getElementById('flash-slider').disabled = !d.flashOk;
-    document.getElementById('cfg-flash-auto').disabled = !d.flashOk;
-
-    if (!cfgLoaded && d.cfg) {
-      cfgLoaded = true;
-      document.getElementById('cfg-armed').checked = d.cfg.armed;
-      document.getElementById('cfg-uconf').value = d.cfg.unknownConfirm;
-      document.getElementById('flash-slider').value = d.cfg.flashDuty;
-      document.getElementById('flash-val').textContent = d.cfg.flashDuty;
-      document.getElementById('cfg-flash-auto').checked = d.cfg.flashAuto;
-      document.getElementById('cfg-hmir').checked = d.cfg.hmirror;
-      document.getElementById('cfg-vflip').checked = d.cfg.vflip;
-      document.getElementById('cfg-res').value = String(d.cfg.frameRes);
-      document.getElementById('cfg-qual').value = String(d.cfg.jpegQuality);
-      document.getElementById('qual-val').textContent = String(d.cfg.jpegQuality);
-    }
-  } catch (err) {}
-}
-
-function renderFaceTable(list, activeMatchId) {
-  const sig = list.map(i => i.id + ':' + i.name).join('|') + '@' + activeMatchId;
-  if (sig === lastListSig) return;
-  lastListSig = sig;
-
-  const tbody = document.getElementById('face-table-body');
-  tbody.innerHTML = '';
-  if (list.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-muted);padding:14px">No enrolled faces synced from Laptop yet.</td></tr>';
-    return;
-  }
-  list.forEach(item => {
-    const tr = document.createElement('tr');
-    const isCurrent = (item.id === activeMatchId);
-    const tdId = document.createElement('td');
-    tdId.innerHTML = '<span class="badge ' + (isCurrent ? 'ok' : 'off') + '">#' + item.id + '</span>';
-    const tdName = document.createElement('td');
-    tdName.innerHTML = '<strong>' + escapeHtml(item.name) + '</strong>' + (isCurrent ? ' <span style="font-size:.72rem;color:var(--success)">[IN VIEW]</span>' : '');
-    const tdAct = document.createElement('td');
-    tdAct.style.textAlign = 'right';
-    const btn = document.createElement('button');
-    btn.className = 'danger';
-    btn.style.padding = '3px 8px';
-    btn.style.fontSize = '.75rem';
-    btn.textContent = 'Delete';
-    btn.onclick = () => deleteFace(item.id, item.name);
-    tdAct.appendChild(btn);
-    tr.appendChild(tdId);
-    tr.appendChild(tdName);
-    tr.appendChild(tdAct);
-    tbody.appendChild(tr);
-  });
-}
-
-function escapeHtml(str) {
-  return str.replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag));
-}
-
-async function deleteFace(id, name) {
-  if (confirm('Delete face #' + id + ' ("' + name + '") on Laptop?')) {
-    await fetch('/api/delete?id=' + id, { method: 'POST' });
-    showToast('Requested delete for #' + id);
-    refreshStatus();
-  }
-}
-
-async function clearAllFaces() {
-  if (confirm('Clear ALL enrolled faces from Laptop directory?')) {
-    await fetch('/api/clear', { method: 'POST' });
-    showToast('Requested clear all faces');
-    refreshStatus();
-  }
-}
-
-async function saveSettings() {
-  const q = new URLSearchParams({
-    armed: document.getElementById('cfg-armed').checked ? 1 : 0,
-    uconf: document.getElementById('cfg-uconf').value,
-    flash: document.getElementById('flash-slider').value,
-    flash_auto: document.getElementById('cfg-flash-auto').checked ? 1 : 0,
-    hmir: document.getElementById('cfg-hmir').checked ? 1 : 0,
-    vflip: document.getElementById('cfg-vflip').checked ? 1 : 0,
-    res: document.getElementById('cfg-res').value,
-    qual: document.getElementById('cfg-qual').value
-  });
-  await fetch('/api/config?' + q.toString(), { method: 'POST' });
-  showToast('Settings saved to NVS');
-  cfgLoaded = false;
-  refreshStatus();
-}
-
-async function testDoor(ok) {
-  const r = await fetch('/api/test?ok=' + ok, { method: 'POST' });
-  const d = await r.json();
-  showToast(d.sent ? 'Test sent to hub' : 'Hub test unavailable');
-}
-
-initCamera();
-refreshStatus();
-setInterval(refreshStatus, 800);
-</script>
-</body>
-</html>)HTML";
-  server.send_P(200, "text/html", HTML);
+void redirectToStream() {
+  String host = server.hostHeader();
+  int colon = host.indexOf(':');
+  if (colon > 0) host = host.substring(0, colon);
+  if (host.isEmpty()) host = camNetIpString();
+  server.sendHeader("Location", "http://" + host + ":" + String(STREAM_PORT) + "/stream");
+  server.send(302, "text/plain", "Redirecting to the camera stream");
 }
 
 } // namespace
@@ -1890,14 +1202,17 @@ void setup() {
   Serial.println("\n=== Smart Home Camera 1 (Temp Stream + Remote Laptop AI) ===");
 
   stateMutex = xSemaphoreCreateMutex();
-  g_motionJpgBuf = static_cast<uint8_t *>(ps_malloc(MAX_MOTION_JPG_BUF));
-  if (!g_motionJpgBuf) {
-    g_motionJpgBuf = static_cast<uint8_t *>(malloc(MAX_MOTION_JPG_BUF));
-  }
   camHwInitPreview();
+  if (camHwFlashAvailable() && psramFound()) {
+    g_motionJpgBuf = static_cast<uint8_t *>(ps_malloc(MAX_MOTION_JPG_BUF));
+  }
 
   StreamConfig cfg;
   loadConfigFromNvs(cfg);
+  if (!psramFound()) {
+    cfg.frameRes = 0;
+    Serial.println("[STREAM] PSRAM unavailable; using QVGA");
+  }
 
   // Initialize Wi-Fi + ESP-NOW before camera sensor setup so RF calibration finishes cleanly.
   camNetInit(SmartHomeNet::CAM_SOURCE_FACE);
@@ -1926,16 +1241,9 @@ void setup() {
 
   camHwStartStreamServer(STREAM_PORT);
 
-  // Dashboard & camera preview routes
-  server.on("/", HTTP_GET, handleRoot);
+  server.on("/", HTTP_GET, redirectToStream);
+  server.on("/stream", HTTP_GET, redirectToStream);
   server.on("/preview.jpg", HTTP_GET, handlePreview);
-  server.on("/stream", HTTP_GET, []() {
-    String host = server.hostHeader();
-    int colon = host.indexOf(':');
-    if (colon > 0) host = host.substring(0, colon);
-    server.sendHeader("Location", "http://" + host + ":81/stream");
-    server.send(302, "text/plain", "Redirecting to :81/stream");
-  });
 
   // Status, configuration & manual test routes
   server.on("/api/status", HTTP_GET, handleStatus);

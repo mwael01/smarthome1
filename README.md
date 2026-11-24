@@ -103,34 +103,36 @@ pio device monitor -b 115200
 
 ---
 
-## Web Dashboards & Enrollment
+## Camera streaming and laptop recognition
 
-1. Power on the **Main Hub** first (`SmartHome-Net` SoftAP starts on channel `1`).
-2. Power on the **ESP32-S3 face camera**. It automatically joins `SmartHome-Net`.
-3. Connect your phone or laptop to Wi-Fi **`SmartHome-Net`** (password: **`smarthome123`**):
-   - **Main Hub Status**: `http://192.168.4.1`
-   - **Face camera stream**: `http://192.168.4.101` — The laptop runs enrollment, face detection, and recognition against the live MJPEG stream.
-   - **Main Hub**: `http://192.168.4.1` — RFID authorization controls the car gate.
+| Mode | Camera firmware | Wi-Fi | Direct MJPEG preview |
+| --- | --- | --- | --- |
+| Standalone | `cam_face_stream_s3_standalone` | `SmartHome-FaceCam` | `http://192.168.11.1:81/stream` |
+| With hub | `cam_face_stream_s3` | `SmartHome-Net` | `http://192.168.4.101:81/stream` |
 
-> **Standalone bench setup**
->
-> If the camera cannot join `SmartHome-Net` within about 12 seconds, connect to `SmartHome-FaceCam` using `smarthome123`, then open `http://192.168.11.1`. This network has no internet access. The camera retries the hub after the hotspot has been idle for 30 seconds and closes the hotspot once it rejoins the hub.
+Both Wi-Fi networks use `smarthome123`. The camera's port 80 root redirects to the raw stream. Its control and recognition API stays on port 80. The hub dashboard remains at `http://192.168.4.1`. The integrated camera starts its fallback hotspot if it cannot join the hub after about 12 seconds.
 
-### Standalone camera preview and speed test
+Start the laptop face bridge with the low-bandwidth profile. Omit `--standalone` on `SmartHome-Net`.
 
-1. Flash just the camera with `pio run -e cam_face_stream_s3_standalone -t upload`. This build starts the hotspot at boot and keeps it dedicated to the direct laptop link.
-2. Join `SmartHome-FaceCam` using `smarthome123`. Open the dashboard at `http://192.168.11.1` or the direct MJPEG preview at `http://192.168.11.1:81/stream`.
-3. Close the preview before measuring single-client speed. Run `python3 tools/test_camera_stream.py` on the laptop. It checks 120 consecutive JPEGs and reports time to first frame, received FPS, and JPEG throughput.
-4. Compare VGA and QVGA in the dashboard settings. QVGA uses less bandwidth. VGA gives the laptop AI more detail. Repeat the speed test after changing the resolution or JPEG quality.
-5. Run `python3 tools/laptop_face_bridge.py --standalone` on the laptop. The bridge reads MJPEG on port 81 and posts recognition results to the camera dashboard on port 80. Check that the dashboard shows **LAPTOP AI** online and updates the face box and match name. Use `--no-gui` if you only want the browser preview. Recognition and enrollment work with the hub powered off.
+```bash
+python3 tools/laptop_face_bridge.py --standalone --resolution qvga --jpeg-quality 16
+```
 
-For a camera board with the Nulllab-compatible onboard flashlight circuit, use `pio run -e cam_face_stream_s3_standalone_gpio3 -t upload`. Open `http://192.168.11.1`, turn off Auto Flash, and raise Flash LED Brightness slightly to check the white light. GPIO3 is an active-high flashlight output on that circuit. Compare your board with the vendor layout before using this target. [Nulllab board layout and pinout](https://github.com/nulllaborg/esp32s3-cam#hardware) · [Nulllab schematic](https://github.com/nulllaborg/esp32s3-cam/blob/main/esp32s3_cam_sch.pdf)
+QVGA is 320×240. Use `hvga` (480×320) or `vga` (640×480) if the recognition model needs more detail. Higher JPEG quality numbers send smaller images. The camera saves explicit settings and uses QVGA on a fresh configuration. Press **E** in the laptop preview to enroll a face.
 
-### Streaming with the hub
+For a raw receiver test, close other viewers and run the following command. Use `192.168.4.101` for the integrated mode.
 
-Flash `cam_face_stream_s3` for hub operation, or `cam_face_stream_s3_gpio3` if you verified the white flashlight on GPIO3. Connect the laptop to `SmartHome-Net`, then run `python3 tools/laptop_face_bridge.py`. The camera dashboard is at `http://192.168.4.101`.
+```bash
+python3 tools/test_camera_stream.py --url http://192.168.11.1:81/stream --frames 300 --resolution qvga
+```
 
-For a throughput comparison, run `python3 tools/test_camera_stream.py --url http://192.168.4.101:81/stream --frames 300` with the laptop AI and extra preview tabs closed. Repeat with the hub dashboard open to measure the effect of an extra viewer. If the stream stutters, compare HVGA or QVGA with VGA in the camera dashboard at the same distance and lighting.
+Compare received FPS and the longest gap between frames at each resolution. Repeat with the hub preview or laptop AI running to measure the extra load.
+
+For hardware with a verified GPIO3 flashlight, use `cam_face_stream_s3_standalone_gpio3` or `cam_face_stream_s3_gpio3`. The flashlight controls remain available through a POST to `/api/config?flash_auto=0&flash=25` on port 80. Set `flash=0` to turn it off. [Nulllab board layout and pinout](https://github.com/nulllaborg/esp32s3-cam#hardware)
+
+### Internet access while streaming
+
+The camera and hub hotspots carry local traffic. Keep a separate internet connection on the laptop, such as Ethernet, and reconnect to the ESP hotspot to renew its DHCP lease after updating the firmware. The laptop tools connect directly to the ESP IP and bypass system HTTP proxies. If the host still prefers the hotspot for DNS, configure that Wi-Fi profile as local-only and use DNS from the internet-connected interface.
 
 ---
 

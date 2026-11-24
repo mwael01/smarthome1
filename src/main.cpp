@@ -1532,7 +1532,7 @@ void handleRoot() {
       <div class="cam-actions">
         <button onclick="triggerAction('door_open')">🔓 Unlock Door (Servo 3)</button>
         <button class="secondary" onclick="triggerAction('door_close')">🔒 Lock Door</button>
-        <a id="cam1LinkBtn" class="btn secondary" href="http://192.168.4.101/" target="_blank">Open Camera UI ↗</a>
+        <a id="cam1LinkBtn" class="btn secondary" href="http://192.168.4.101/" target="_blank">Open Camera Stream ↗</a>
       </div>
     </div>
 
@@ -2311,7 +2311,8 @@ void initHubWiFi() {
                  SmartHomeNet::HUB_IP[2], SmartHomeNet::HUB_IP[3]);
   IPAddress subnet(SmartHomeNet::SUBNET_MASK[0], SmartHomeNet::SUBNET_MASK[1],
                    SmartHomeNet::SUBNET_MASK[2], SmartHomeNet::SUBNET_MASK[3]);
-  WiFi.softAPConfig(apIp, apIp, subnet);
+  // The hub AP serves the local camera and controls. Its STA uplink is separate.
+  WiFi.softAPConfig(apIp, IPAddress(0, 0, 0, 0), subnet);
   WiFi.softAP(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL, 0, 8);
 
   if (hasSta) {

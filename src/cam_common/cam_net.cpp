@@ -114,7 +114,8 @@ bool startFallbackApLocked() {
   IPAddress subnet(255, 255, 255, 0);
   String apSsid = camNetFallbackApSsid();
   // Remove the STA interface so its scans cannot interrupt association or DHCP.
-  if (!WiFi.mode(WIFI_AP) || !WiFi.softAPConfig(apIp, apIp, subnet) ||
+  // This hotspot serves local traffic only. DHCP must not advertise a default route.
+  if (!WiFi.mode(WIFI_AP) || !WiFi.softAPConfig(apIp, IPAddress(0, 0, 0, 0), subnet) ||
       !WiFi.softAP(apSsid.c_str(), SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL, 0, 2)) {
     Serial.println("[WIFI] Failed to start fallback AP or configure its IP/DHCP");
     return false;
