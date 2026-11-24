@@ -1,0 +1,14 @@
+# Smart Home Security — face-recognition demo dependencies.
+# Target: Python 3.11 on native Windows (team env) — see docs/03-implementation/setup.md.
+#
+# dlib (pulled in by face_recognition) is SOURCE-ONLY on PyPI — it compiles from
+# C++ source on every OS. On Windows that needs Visual Studio C++ Build Tools +
+# a cmake on PATH; the setup guide installs both before this file is used.
+#
+# `numpy<2` is a compatibility guard: dlib's Python bindings are not guaranteed
+# against numpy 2.x. `face_recognition==1.3.0` is the project's stable release.
+# These pins are a starting point — verify on the target machine before locking.
+face_recognition==1.3.0
+opencv-python>=4.8
+numpy>=1.24,<2
+Pillow>=10
