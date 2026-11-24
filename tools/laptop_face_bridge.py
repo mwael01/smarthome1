@@ -428,62 +428,86 @@ class LaptopFaceBridge:
         self.last_result_sent = result
         return response
 
-    def draw_hud(self, bgr_img: np.ndarray, verdict: dict, fps: float) -> np.ndarray:
-        frame = bgr_img.copy()
-        h, w = frame.shape[:2]
+    def draw_hud(self, bgr_img: Optional[np.ndarray], verdict: dict, fps: float,
+                 size: Tuple[int, int] = (960, 720)) -> np.ndarray:
+        width, height = size
+        canvas = np.empty((height, width, 3), dtype=np.uint8)
+        cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), (24, 21, 18), cv2.FILLED)
+        header, footer = min(60, height // 4), min(68, height // 4)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text = (241, 237, 230)
+        muted = (174, 165, 156)
+        teal = (190, 227, 89)
+        live = bgr_img is not None
 
-        result = verdict.get("result", "no_face")
-        name = verdict.get("name", "---")
-        conf = verdict.get("confidence", 0.0)
-        box = verdict.get("box", [0, 0, 0, 0])
-        infer_ms = verdict.get("inferenceMs", 0)
+        def write(label, x, y, scale, color, available, thickness=1):
+            (pixels, _), _ = cv2.getTextSize(label, font, scale, thickness)
+            cv2.putText(canvas, label, (x, y), font, scale * min(1, available / max(1, pixels)),
+                        color, thickness, cv2.LINE_AA)
 
-        # Draw Top Status Bar
-        cv2.rectangle(frame, (0, 0), (w, 38), (20, 20, 20), -1)
-        status_text = (
-            f"ESP32-CAM: {self.client.cam_ip} | {w}x{h} | FPS: {fps:.1f} | "
-            f"Infer: {infer_ms}ms | Enrolled: {len(self.engine.known_names)}"
-        )
-        cv2.putText(frame, status_text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (220, 220, 220), 1, cv2.LINE_AA)
+        if header >= 28 and width >= 100:
+            cv2.line(canvas, (0, header - 1), (width - 1, header - 1), (55, 48, 40))
+            if width >= 285:
+                cv2.circle(canvas, (width - 101, header // 2), 4, teal if live else muted, -1, cv2.LINE_AA)
+                write("LIVE" if live else "WAITING", width - 89, header // 2 + 5,
+                      0.47, teal if live else muted, 77)
+            write("Face recognition", 18, header // 2 + 7, 0.67, text,
+                  width - (145 if width >= 285 else 36), 2)
 
-        # Draw Face Reticle
-        if verdict.get("faceDetected") and box != [0, 0, 0, 0]:
-            left, top, right, bottom = box
-            if result == "recognized":
-                color = (0, 255, 0)      # Bright Green = Authorized
-                tag = f"RECOGNIZED: {name.upper()} ({int(conf * 100)}%)"
-            elif result == "unknown":
-                color = (0, 0, 255)      # Red = Unknown Intruder
-                tag = f"UNKNOWN FACE ({int(conf * 100)}%)"
-            else:
-                color = (0, 255, 255)    # Yellow = Aligning / Unregistered
-                tag = f"DETECTED FACE (Press 'e' to enroll)"
+        if live:
+            source_h, source_w = bgr_img.shape[:2]
+            available_h = height - header - footer
+            scale = min(width / source_w, available_h / source_h)
+            video_w, video_h = max(1, round(source_w * scale)), max(1, round(source_h * scale))
+            offset_x = (width - video_w) // 2
+            offset_y = header + (available_h - video_h) // 2
+            video = canvas[offset_y:offset_y + video_h, offset_x:offset_x + video_w]
+            interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+            cv2.resize(bgr_img, (video_w, video_h), dst=video, interpolation=interpolation)
 
-            # Draw rounded bounding box
-            cv2.rectangle(frame, (left, top), (right, bottom), color, 2, cv2.LINE_AA)
-            # Reticle corners
-            corner_len = min(20, (right - left) // 4)
-            cv2.line(frame, (left, top), (left + corner_len, top), color, 4)
-            cv2.line(frame, (left, top), (left, top + corner_len), color, 4)
-            cv2.line(frame, (right, top), (right - corner_len, top), color, 4)
-            cv2.line(frame, (right, top), (right, top + corner_len), color, 4)
-            cv2.line(frame, (left, bottom), (left + corner_len, bottom), color, 4)
-            cv2.line(frame, (left, bottom), (left, bottom - corner_len), color, 4)
-            cv2.line(frame, (right, bottom), (right - corner_len, bottom), color, 4)
-            cv2.line(frame, (right, bottom), (right, bottom - corner_len), color, 4)
+            box = verdict.get("box")
+            if verdict.get("faceDetected") and box is not None and len(box) == 4:
+                x1, y1, x2, y2 = (
+                    round(box[0] * video_w / source_w), round(box[1] * video_h / source_h),
+                    round(box[2] * video_w / source_w), round(box[3] * video_h / source_h),
+                )
+                x1, x2 = max(0, x1), min(video_w - 1, x2)
+                y1, y2 = max(0, y1), min(video_h - 1, y2)
+                if x2 > x1 and y2 > y1:
+                    result = verdict.get("result")
+                    if result == "recognized":
+                        color = teal
+                        tag = f"{verdict.get('name', 'Recognized')}  {verdict.get('confidence', 0):.0%}"
+                    elif result == "unknown":
+                        color, tag = (113, 128, 255), "Unknown face"
+                    else:
+                        color, tag = (104, 208, 250), "Face detected"
+                    corner = min(20, (x2 - x1) // 3, (y2 - y1) // 3)
+                    for x, dx in ((x1, 1), (x2, -1)):
+                        for y, dy in ((y1, 1), (y2, -1)):
+                            cv2.line(video, (x, y), (x + dx * corner, y), color, 2, cv2.LINE_AA)
+                            cv2.line(video, (x, y), (x, y + dy * corner), color, 2, cv2.LINE_AA)
 
-            # Draw Tag Background
-            (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-            tag_y = max(top - 8, th + 44)
-            cv2.rectangle(frame, (left, tag_y - th - 6), (left + tw + 10, tag_y + 4), color, -1)
-            cv2.putText(frame, tag, (left + 5, tag_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
+                    if video_w >= 80 and video_h >= 30:
+                        (tag_w, _), _ = cv2.getTextSize(tag, font, 0.52, 1)
+                        tag_w = min(tag_w + 16, video_w)
+                        tag_x = min(x1, video_w - tag_w)
+                        tag_y = max(0, y1 - 28) if y1 >= 28 else min(y2 + 5, video_h - 23)
+                        cv2.rectangle(video, (tag_x, tag_y), (tag_x + tag_w - 1, tag_y + 22), color, -1)
+                        write(tag, offset_x + tag_x + 8, offset_y + tag_y + 16, 0.52, (26, 25, 23), tag_w - 16)
+        elif width >= 100:
+            write("Waiting for camera", 18, height // 2, 0.62, muted, width - 36)
 
-        # Draw Bottom Help Bar
-        cv2.rectangle(frame, (0, h - 28), (w, h), (20, 20, 20), -1)
-        help_text = "[E] Enroll Face in View   |   [R] Reload Known Faces   |   [Q/ESC] Quit"
-        cv2.putText(frame, help_text, (10, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 230, 230), 1, cv2.LINE_AA)
-
-        return frame
+        if footer >= 25 and width >= 100:
+            cv2.line(canvas, (0, height - footer), (width - 1, height - footer), (55, 48, 40))
+            stats = self.client.cam_ip
+            if live:
+                stats = (f"{source_w}x{source_h} source   |   Preview {fps:.1f} FPS"
+                         f"   |   AI {verdict.get('inferenceMs', 0)} ms")
+            write(stats, 18, height - footer + 23, 0.52, text, width - 36)
+            if footer >= 48 and width >= 210:
+                write("E  Enroll     R  Reload faces     Q  Quit", 18, height - 15, 0.46, muted, width - 36)
+        return canvas
 
     def run(self):
         reader = threading.Thread(target=self._stream_reader_loop, daemon=True)
@@ -503,10 +527,32 @@ class LaptopFaceBridge:
         fps_timer = time.time()
         fps_frame_counter = 0
         window_name = "Smart Home Face Recognition - Camera 1"
+        preview_size = (960, 720)
+        painted_size = preview_size
+        painted_frame = None
+        current_bgr = None
+        verdict = {}
+
+        def paint_preview(frame, overlay):
+            nonlocal preview_size, painted_size, painted_frame
+            try:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) == 0:
+                    return False
+                _, _, width, height = cv2.getWindowImageRect(window_name)
+                if width > 0 and height > 0:
+                    preview_size = width, height
+            except cv2.error:
+                # Some HighGUI backends do not expose the drawable size.
+                pass
+            if frame is not painted_frame or preview_size != painted_size:
+                cv2.imshow(window_name, self.draw_hud(frame, overlay, self.fps, preview_size))
+                painted_frame, painted_size = frame, preview_size
+            return True
 
         if self.show_gui:
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window_name, 800, 600)
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+            cv2.resizeWindow(window_name, *preview_size)
+            cv2.imshow(window_name, self.draw_hud(None, {}, 0.0, preview_size))
 
         last_frame_number = 0
 
@@ -517,10 +563,13 @@ class LaptopFaceBridge:
                     frame_number = self.frames_count
                     frame_at = self._latest_frame_at
 
-                if (jpg_bytes is None or frame_number == last_frame_number
-                        or time.monotonic() - frame_at > 1.0):
-                    if self.show_gui and (cv2.waitKey(1) & 0xFF) in (27, ord('q'), ord('Q')):
-                        break
+                camera_live = jpg_bytes is not None and time.monotonic() - frame_at <= 1.0
+                if not camera_live or frame_number == last_frame_number:
+                    if self.show_gui:
+                        if not paint_preview(current_bgr if camera_live else None, verdict):
+                            break
+                        if (cv2.waitKey(1) & 0xFF) in (27, ord('q'), ord('Q')):
+                            break
                     self._stop.wait(0.02)
                     continue
 
@@ -584,8 +633,8 @@ class LaptopFaceBridge:
 
                 # Display live GUI
                 if self.show_gui:
-                    hud_frame = self.draw_hud(current_bgr, verdict, self.fps)
-                    cv2.imshow(window_name, hud_frame)
+                    if not paint_preview(current_bgr, verdict):
+                        break
 
                     key = cv2.waitKey(1) & 0xFF
                     if key in (27, ord('q'), ord('Q')):
