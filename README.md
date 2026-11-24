@@ -132,7 +132,7 @@ python3 tools/test_camera_stream.py --url http://192.168.11.1:81/stream --frames
 
 Compare received FPS and the longest gap between frames at each resolution. Repeat with the hub preview or laptop AI running to measure the extra load. Compare those results with `fps` (valid camera captures) and `publishFps` (frames made available to viewers) in `/api/status`.
 
-For hardware with a verified GPIO3 flashlight, use `cam_face_stream_s3_standalone_gpio3` or `cam_face_stream_s3_gpio3`. The flashlight controls remain available through a POST to `/api/config?flash_auto=0&flash=25` on port 80. Set `flash=0` to turn it off. [Nulllab board layout and pinout](https://github.com/nulllaborg/esp32s3-cam#hardware)
+To identify the white flashlight's control pin, run `python3 tools/identify_flash_gpio.py`. The script guides unpowered multimeter measurements and flags pins shared with boot, memory, camera, USB, or UART signals. It uses the readings you enter and requires no connection to the ESP. A continuity match identifies a connection to the selected control point. Verify the circuit and active level before configuring a firmware output. [Espressif GPIO restrictions](https://docs.espressif.com/projects/esp-idf/en/v4.4.1/esp32s3/api-reference/peripherals/gpio.html) · [Fluke continuity guidance](https://www.fluke.com/en-sg/learn/blog/electrical/what-is-continuity)
 
 ### Internet access while streaming
 
