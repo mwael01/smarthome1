@@ -3,6 +3,8 @@
 from collections import deque
 import errno
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -16,8 +18,14 @@ import cv2
 import numpy as np
 
 from tools.camera_stream import iter_jpegs
-from tools.laptop_face_bridge import LaptopFaceBridge
-from tools.laptop_hub import DEFAULT_PREVIEW_PORT, LaptopHubClient, make_preview_server
+from tools.laptop_face_bridge import (
+    DEFAULT_TOLERANCE,
+    FastFaceEngine,
+    LaptopFaceBridge,
+    MARGIN,
+    OVERLAY_MAX_AGE,
+)
+from tools.laptop_hub import DEFAULT_PREVIEW_PORT, FRAME_MAX_AGE, LaptopHubClient, make_preview_server
 from tools.serial_camera import HEADER, MAGIC, SerialCamera
 
 
@@ -243,6 +251,67 @@ class TestUartBridge(unittest.TestCase):
                         hub_thread.join(timeout=3)
                 self.assertFalse(bridge_thread.is_alive())
                 self.assertIn(b"\nSTOP\n", serial_commands)
+
+    def test_overlay_max_age_matches_frame_max_age(self):
+        self.assertEqual(OVERLAY_MAX_AGE, FRAME_MAX_AGE)
+        self.assertEqual(DEFAULT_TOLERANCE, 0.6)
+        self.assertEqual(MARGIN, 0.06)
+
+    def test_fast_face_engine_restores_grouped_median_and_fallback_detection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for fname in ("khaled-naser-1.jpeg", "khaled-naser-2.jpeg", "khaled-niazy-1.jpeg"):
+                cv2.imwrite(os.path.join(tmpdir, fname), np.zeros((40, 40, 3), dtype=np.uint8))
+
+            fake_encodings = {
+                "khaled-naser-1.jpeg": np.array([0.0, 0.0]),
+                "khaled-naser-2.jpeg": np.array([0.1, 0.0]),
+                "khaled-niazy-1.jpeg": np.array([1.0, 0.0]),
+            }
+            calls = []
+
+            class FakeFaces:
+                @staticmethod
+                def load_image_file(path):
+                    return os.path.basename(path)
+
+                @staticmethod
+                def face_locations(rgb, number_of_times_to_upsample=1):
+                    calls.append(number_of_times_to_upsample)
+                    if number_of_times_to_upsample == 1:
+                        return []
+                    return [(10, 90, 90, 10), (20, 200, 100, 120)]
+
+                @staticmethod
+                def face_encodings(img, known_face_locations=None):
+                    if isinstance(img, str):
+                        return [fake_encodings[img]]
+                    if len(known_face_locations) == 1:
+                        return [np.array([0.05, 0.0])]
+                    # First face is unknown/far, second face matches khaled-naser clearly.
+                    return [np.array([5.0, 0.0]), np.array([0.05, 0.0])]
+
+                @staticmethod
+                def face_distance(refs, encoding):
+                    return np.array([float(np.linalg.norm(ref - encoding)) for ref in refs])
+
+            engine = FastFaceEngine(tmpdir, faces_module=FakeFaces())
+            self.assertEqual(engine.known_names, ["khaled-naser", "khaled-niazy"])
+            self.assertEqual(len(engine.known["khaled-naser"]), 2)
+
+            frame = np.zeros((240, 320, 3), dtype=np.uint8)
+            verdict = engine.analyze_frame(frame)
+            self.assertEqual(calls, [1, 0])
+            self.assertEqual(verdict["result"], "recognized")
+            self.assertEqual(verdict["name"], "Khaled Naser")
+            self.assertEqual(verdict["matchId"], 0)
+            self.assertEqual(len(verdict["faces"]), 2)
+            self.assertEqual(verdict["faces"][0]["result"], "unknown")
+            self.assertEqual(verdict["faces"][1]["result"], "recognized")
+
+            # Incremental enrollment saves khaled-naser-3.jpg without overwriting existing photos.
+            self.assertTrue(engine.enroll(frame, [10, 10, 90, 90], "Khaled Naser"))
+            self.assertTrue(os.path.isfile(os.path.join(tmpdir, "khaled-naser-3.jpg")))
+            self.assertEqual(len(engine.known["khaled-naser"]), 3)
 
 
 if __name__ == "__main__":

@@ -1253,13 +1253,56 @@ void handleApiConfig() {
 // ---------------------------------------------------------------------------
 // Web API: Update Home Wi-Fi Uplink (/api/wifi)
 // ---------------------------------------------------------------------------
+constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 15000;
+bool staConnectActive = false;
+unsigned long staConnectStartedMs = 0;
+
+void stopStaAndKeepSoftAp(const char *logLevel, const char *logMsg) {
+  staConnectActive = false;
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
+  esp_wifi_set_inactive_time(WIFI_IF_AP, 600);
+  if (logLevel && logMsg) {
+    addEventLog(logLevel, logMsg);
+  }
+}
+
+void startBoundedStaConnect() {
+  if (strlen(g_cfg.staSsid) == 0) {
+    return;
+  }
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(false);
+  WiFi.begin(g_cfg.staSsid, g_cfg.staPass);
+  staConnectActive = true;
+  staConnectStartedMs = millis();
+}
+
+void updateHubWiFi(unsigned long now) {
+  if (!staConnectActive) {
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    staConnectActive = false;
+    return;
+  }
+  if (now - staConnectStartedMs >= STA_CONNECT_TIMEOUT_MS) {
+    stopStaAndKeepSoftAp(
+        "warning",
+        "Home Wi-Fi unreachable; stopped scanning to keep SoftAP stable");
+  }
+}
+
 void handleApiWifi() {
   if (server.hasArg("disconnect") && server.arg("disconnect").toInt() == 1) {
     g_cfg.staSsid[0] = '\0';
     g_cfg.staPass[0] = '\0';
     saveConfigToNvs();
-    WiFi.disconnect(true);
-    addEventLog("warning", "Home Wi-Fi cleared. Running in SoftAP-only mode.");
+    stopStaAndKeepSoftAp("warning", "Home Wi-Fi cleared. Running in SoftAP-only mode.");
     server.send(200, "application/json", "{\"disconnected\":true}");
     return;
   }
@@ -1274,11 +1317,12 @@ void handleApiWifi() {
     saveConfigToNvs();
 
     if (strlen(g_cfg.staSsid) > 0) {
-      WiFi.mode(WIFI_AP_STA);
-      WiFi.begin(g_cfg.staSsid, g_cfg.staPass);
+      startBoundedStaConnect();
       char msg[72];
       snprintf(msg, sizeof(msg), "Connecting to Home Wi-Fi: \"%s\"...", g_cfg.staSsid);
       addEventLog("info", msg);
+    } else {
+      stopStaAndKeepSoftAp("info", "Home Wi-Fi cleared. Running in SoftAP-only mode.");
     }
     server.send(200, "application/json", "{\"connecting\":true}");
     return;
@@ -2131,17 +2175,38 @@ setInterval(refreshStatus, 1000);
 // ---------------------------------------------------------------------------
 // Wi-Fi initialization
 // ---------------------------------------------------------------------------
-void onWiFiEvent(WiFiEvent_t event) {
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:  return "POWERON";
+    case ESP_RST_EXT:      return "EXT";
+    case ESP_RST_SW:       return "SW";
+    case ESP_RST_PANIC:    return "PANIC";
+    case ESP_RST_INT_WDT:  return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT:      return "WDT";
+    case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO:     return "SDIO";
+    default:               return "UNKNOWN";
+  }
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Device connected to Hub SoftAP (%d active)", WiFi.softAPgetStationNum() + 1);
+    char msg[72];
+    snprintf(msg, sizeof(msg), "Device connected to Hub SoftAP (%d active)", WiFi.softAPgetStationNum());
     addEventLog("info", msg);
   } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Device disconnected from Hub SoftAP (%d active)", WiFi.softAPgetStationNum());
+    const uint8_t *mac = info.wifi_ap_stadisconnected.mac;
+    char msg[72];
+    snprintf(msg, sizeof(msg), "Device disconnected from SoftAP (aid=%u, ..:%02X:%02X, %d active)",
+             static_cast<unsigned>(info.wifi_ap_stadisconnected.aid),
+             mac[4], mac[5],
+             WiFi.softAPgetStationNum());
     addEventLog("info", msg);
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-    char msg[64];
+    staConnectActive = false;
+    char msg[72];
     snprintf(msg, sizeof(msg), "Home Wi-Fi connected! Assigned IP: %s", WiFi.localIP().toString().c_str());
     addEventLog("success", msg);
     configTime(0, 0, "pool.ntp.org", "time.google.com");
@@ -2149,37 +2214,45 @@ void onWiFiEvent(WiFiEvent_t event) {
     static unsigned long lastStaDiscMs = 0;
     if (millis() - lastStaDiscMs >= 10000) {
       lastStaDiscMs = millis();
-      addEventLog("warning", "Home Wi-Fi station link disconnected");
+      char msg[72];
+      snprintf(msg, sizeof(msg), "Home Wi-Fi station link disconnected (reason=%u)",
+               static_cast<unsigned>(info.wifi_sta_disconnected.reason));
+      addEventLog("warning", msg);
     }
   }
 }
 
 void initHubWiFi() {
   WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
   WiFi.onEvent(onWiFiEvent);
 
   bool hasSta = (strlen(g_cfg.staSsid) > 0);
-  if (hasSta) {
-    WiFi.mode(WIFI_AP_STA);
-  } else {
-    WiFi.mode(WIFI_AP);
-  }
-
-  // Maximize TX power (19.5 dBm) for maximum wireless coverage to nodes
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.setSleep(false);
+  WiFi.mode(hasSta ? WIFI_AP_STA : WIFI_AP);
 
   IPAddress apIp(SmartHomeNet::HUB_IP[0], SmartHomeNet::HUB_IP[1],
                  SmartHomeNet::HUB_IP[2], SmartHomeNet::HUB_IP[3]);
   IPAddress subnet(SmartHomeNet::SUBNET_MASK[0], SmartHomeNet::SUBNET_MASK[1],
                    SmartHomeNet::SUBNET_MASK[2], SmartHomeNet::SUBNET_MASK[3]);
-  // The hub AP serves the dashboard and accepts laptop recognition events.
-  WiFi.softAPConfig(apIp, IPAddress(0, 0, 0, 0), subnet);
-  WiFi.softAP(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL, 0, 8);
+
+  // Start SoftAP first, then apply IP/gateway, disable modem sleep, and set a
+  // moderate TX power + generous inactivity timeout to avoid brownout drops
+  // and premature client disconnects on both laptops and mobile devices.
+  if (!WiFi.softAP(SmartHomeNet::AP_SSID, SmartHomeNet::AP_PASS, SmartHomeNet::WIFI_CHANNEL, 0, 8)) {
+    Serial.println("[WIFI] ERROR: WiFi.softAP() failed");
+  }
+  delay(50);
+  if (!WiFi.softAPConfig(apIp, apIp, subnet)) {
+    Serial.println("[WIFI] WARNING: WiFi.softAPConfig() failed");
+  }
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
+  esp_wifi_set_inactive_time(WIFI_IF_AP, 600);
 
   if (hasSta) {
-    Serial.printf("[WIFI] Connecting to Home Wi-Fi: %s ...\n", g_cfg.staSsid);
-    WiFi.begin(g_cfg.staSsid, g_cfg.staPass);
+    Serial.printf("[WIFI] Connecting to Home Wi-Fi: %s (15s timeout)...\n", g_cfg.staSsid);
+    startBoundedStaConnect();
   }
 }
 
@@ -2206,7 +2279,8 @@ void setup() {
 
   Serial.begin(115200);
   delay(200);
-  Serial.printf("[BOOT] Reset reason: %d\n", static_cast<int>(esp_reset_reason()));
+  esp_reset_reason_t bootReset = esp_reset_reason();
+  Serial.printf("[BOOT] Reset reason: %d (%s)\n", static_cast<int>(bootReset), resetReasonName(bootReset));
 
   initDefaultSystemTime();
   loadConfigFromNvs();
@@ -2280,6 +2354,7 @@ void sampleSmokeSensor(unsigned long now) {
 void loop() {
   server.handleClient();
   unsigned long now = millis();
+  updateHubWiFi(now);
 
   // Read safety sensors. MQ-2 AO uses ADC1 so Wi-Fi can stay active.
   lastFlameDigital = digitalRead(FIRE_SENSOR_PIN);

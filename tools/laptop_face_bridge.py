@@ -5,11 +5,13 @@ import argparse
 from dataclasses import dataclass
 import multiprocessing
 import os
+import re
 import signal
+import statistics
 import sys
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -24,54 +26,80 @@ else:
     from serial_camera import SerialCamera, UART_BAUD, add_light_argument, validate_light
 
 
-OVERLAY_MAX_AGE = 0.4
+OVERLAY_MAX_AGE = FRAME_MAX_AGE
+DEFAULT_TOLERANCE = 0.6
+MARGIN = 0.06
+_IDENTITY_RE = re.compile(r"^(?P<name>.+)-\d+\.(?:jpe?g|png)$", re.IGNORECASE)
+_SUPPORTED_EXTS = (".jpg", ".jpeg", ".png")
 
 
 def decode_jpeg(jpeg):
     return cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
 
 
+def _identity_from_filename(fname: str) -> str:
+    match = _IDENTITY_RE.match(fname)
+    if match:
+        return match.group("name").strip().lower()
+    stem = os.path.splitext(fname)[0].strip().lower()
+    return re.sub(r"[\s_]+", "-", stem)
+
+
+def _display_name(identity: str) -> str:
+    return identity.replace("-", " ").replace("_", " ").title()
+
+
 class FastFaceEngine:
-    """High-speed multi-scale face detector and ResNet embedding matcher."""
+    """Original face_recognition HOG detector + grouped median ResNet embedding matcher."""
 
-    def __init__(self, faces_dir: str, distance_thresh: float = 0.58):
-        import dlib
-        import face_recognition
+    def __init__(self, faces_dir: str, distance_thresh: float = DEFAULT_TOLERANCE, faces_module=None):
+        if faces_module is None:
+            import face_recognition as faces_module
 
-        self._faces = face_recognition
+        self._faces = faces_module
         self.faces_dir = os.path.abspath(faces_dir)
         self.distance_thresh = distance_thresh
         os.makedirs(self.faces_dir, exist_ok=True)
 
-        self.known_encodings: List[np.ndarray] = []
+        self.known: Dict[str, List[np.ndarray]] = {}
         self.known_names: List[str] = []
-        self.dlib_detector = dlib.get_frontal_face_detector()
         self.lock = threading.Lock()
         self.load_known_faces()
 
     def load_known_faces(self):
         with self.lock:
-            self.known_encodings.clear()
+            self.known.clear()
             self.known_names.clear()
             if not os.path.isdir(self.faces_dir):
                 return
+            total_photos = 0
             for fname in sorted(os.listdir(self.faces_dir)):
-                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                if fname.lower().endswith(_SUPPORTED_EXTS):
                     path = os.path.join(self.faces_dir, fname)
                     try:
                         img = self._faces.load_image_file(path)
                         encs = self._faces.face_encodings(img)
-                        if encs:
-                            self.known_encodings.append(encs[0])
-                            name = os.path.splitext(fname)[0].replace("_", " ")
-                            self.known_names.append(name)
-                            print(f"[FACE-ENGINE] Loaded enrolled profile: \"{name}\" ({fname})")
+                        if not encs:
+                            print(f"[FACE-ENGINE] No face found in {fname}, skipping", file=sys.stderr)
+                            continue
+                        identity = _identity_from_filename(fname)
+                        self.known.setdefault(identity, []).append(encs[0])
+                        total_photos += 1
                     except Exception as e:
                         print(f"[FACE-ENGINE] Error loading {fname}: {e}", file=sys.stderr)
-            print(f"[FACE-ENGINE] Total enrolled faces active: {len(self.known_names)}")
+            self.known_names = list(self.known.keys())
+            for identity in self.known_names:
+                print(
+                    f"[FACE-ENGINE] Loaded identity: \"{_display_name(identity)}\" "
+                    f"({len(self.known[identity])} photo(s))"
+                )
+            print(
+                f"[FACE-ENGINE] Total enrolled identities active: "
+                f"{len(self.known_names)} ({total_photos} photo(s))"
+            )
 
     def enroll(self, bgr_img: np.ndarray, box: List[int], name: str) -> bool:
-        """Enroll face into memory and persist to known_faces/<Name>.jpg."""
+        """Enroll face into memory and persist to known_faces/<identity>-<next_index>.jpg."""
         left, top, right, bottom = box
         rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
         dlib_box = (top, right, bottom, left)
@@ -80,11 +108,23 @@ class FastFaceEngine:
             return False
 
         with self.lock:
-            clean_name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_")).strip()
-            if not clean_name:
-                clean_name = f"User_{len(self.known_names) + 1}"
+            clean_id = re.sub(r"[^a-zA-Z0-9_-]", "", name.strip().lower().replace(" ", "-"))
+            if not clean_id:
+                clean_id = f"user-{len(self.known_names) + 1}"
 
-            # Save full image or cropped face photo
+            existing_indices = []
+            for fname in os.listdir(self.faces_dir):
+                if not fname.lower().endswith(_SUPPORTED_EXTS):
+                    continue
+                match = _IDENTITY_RE.match(fname)
+                if match and match.group("name").lower() == clean_id:
+                    num_match = re.search(r"-(\d+)\.", fname)
+                    if num_match:
+                        existing_indices.append(int(num_match.group(1)))
+
+            next_idx = max(existing_indices, default=0) + 1
+
+            # Save cropped face photo with padding for future reference loading
             h, w = bgr_img.shape[:2]
             pad_x = int((right - left) * 0.25)
             pad_y = int((bottom - top) * 0.25)
@@ -94,113 +134,134 @@ class FastFaceEngine:
             crop_y2 = min(h, bottom + pad_y)
             crop = bgr_img[crop_y1:crop_y2, crop_x1:crop_x2]
 
-            fname = f"{clean_name.replace(' ', '_')}.jpg"
+            fname = f"{clean_id}-{next_idx}.jpg"
             save_path = os.path.join(self.faces_dir, fname)
-            cv2.imwrite(save_path, crop if crop.size > 0 else bgr_img)
+            if not cv2.imwrite(save_path, crop if crop.size > 0 else bgr_img):
+                return False
 
-            if clean_name in self.known_names:
-                idx = self.known_names.index(clean_name)
-                self.known_encodings[idx] = encs[0]
-            else:
-                self.known_names.append(clean_name)
-                self.known_encodings.append(encs[0])
+            if clean_id not in self.known:
+                self.known[clean_id] = []
+                self.known_names.append(clean_id)
+            self.known[clean_id].append(encs[0])
 
-            print(f"[FACE-ENGINE] Successfully enrolled \"{clean_name}\" -> saved to {save_path}")
+            print(f"[FACE-ENGINE] Successfully enrolled \"{_display_name(clean_id)}\" -> saved to {save_path}")
             return True
 
     def analyze_frame(self, bgr_img: np.ndarray) -> dict:
-        t0 = time.time()
+        t0 = time.perf_counter()
         rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
 
-        # Multi-scale face detection:
-        # 1. Primary: face_recognition HOG with upsample=1
-        boxes = self._faces.face_locations(rgb, number_of_times_to_upsample=1, model="hog")
+        # Original face_demo.py detection sequence: HOG upsample=1 with upsample=0 fallback.
+        locations = self._faces.face_locations(rgb, number_of_times_to_upsample=1)
+        if not locations:
+            locations = self._faces.face_locations(rgb, number_of_times_to_upsample=0)
 
-        # 2. Secondary fallback: dlib frontal face detector
-        if not boxes:
-            dlib_rects = self.dlib_detector(rgb, 0)
-            if dlib_rects:
-                boxes = [(r.top(), r.right(), r.bottom(), r.left()) for r in dlib_rects]
-
-        infer_ms = int((time.time() - t0) * 1000.0)
-
-        if not boxes:
+        if not locations:
+            infer_ms = int((time.perf_counter() - t0) * 1000.0)
             return {
                 "result": "no_face",
                 "faceDetected": False,
                 "faceQuality": "NO_FACE",
                 "box": [0, 0, 0, 0],
+                "faces": [],
                 "inferenceMs": infer_ms,
                 "name": "---",
                 "confidence": 0.0,
                 "matchId": -1,
             }
 
-        # Select the largest face in view
-        top, right, bottom, left = max(boxes, key=lambda b: (b[2] - b[0]) * (b[1] - b[3]))
-        # Clamp to frame boundaries
-        top = max(0, min(h - 1, top))
-        bottom = max(0, min(h - 1, bottom))
-        left = max(0, min(w - 1, left))
-        right = max(0, min(w - 1, right))
-        box = [int(left), int(top), int(right), int(bottom)]
+        clamped_locations = []
+        for top, right, bottom, left in locations:
+            top = max(0, min(h - 1, int(top)))
+            bottom = max(0, min(h - 1, int(bottom)))
+            left = max(0, min(w - 1, int(left)))
+            right = max(0, min(w - 1, int(right)))
+            clamped_locations.append((top, right, bottom, left))
 
-        # Extract 128-d face embedding vector
-        encs = self._faces.face_encodings(rgb, [(top, right, bottom, left)])
+        encs = self._faces.face_encodings(rgb, clamped_locations)
+        infer_ms = int((time.perf_counter() - t0) * 1000.0)
         if not encs:
+            top, right, bottom, left = max(
+                clamped_locations, key=lambda b: (b[2] - b[0]) * (b[1] - b[3])
+            )
+            box = [left, top, right, bottom]
             return {
                 "result": "aligning",
                 "faceDetected": True,
                 "faceQuality": "BLURRY",
                 "box": box,
+                "faces": [{
+                    "result": "aligning",
+                    "box": box,
+                    "name": "Aligning",
+                    "confidence": 0.0,
+                    "matchId": -1,
+                }],
                 "inferenceMs": infer_ms,
                 "name": "Aligning",
                 "confidence": 0.0,
                 "matchId": -1,
             }
 
+        faces = []
         with self.lock:
-            if not self.known_encodings:
-                return {
-                    "result": "unknown",
-                    "faceDetected": True,
-                    "faceQuality": "READY",
-                    "box": box,
-                    "inferenceMs": infer_ms,
-                    "name": "Unknown",
-                    "confidence": 0.0,
-                    "matchId": -1,
-                    "unregistered": True,
-                }
+            for (top, right, bottom, left), encoding in zip(clamped_locations, encs):
+                box = [left, top, right, bottom]
+                if not self.known:
+                    faces.append({
+                        "result": "unknown",
+                        "box": box,
+                        "name": "Unknown",
+                        "confidence": 0.0,
+                        "matchId": -1,
+                        "unregistered": True,
+                    })
+                    continue
 
-            dists = self._faces.face_distance(self.known_encodings, encs[0])
-            best_idx = int(np.argmin(dists))
-            best_dist = float(dists[best_idx])
-            sim = max(0.0, min(1.0, 1.0 - (best_dist / self.distance_thresh) * 0.5))
+                ranked = sorted(
+                    (
+                        float(statistics.median(self._faces.face_distance(refs, encoding))),
+                        idx,
+                        identity,
+                    )
+                    for idx, (identity, refs) in enumerate(self.known.items())
+                )
+                best_dist, best_idx, identity = ranked[0]
+                sim = max(0.0, min(1.0, 1.0 - (best_dist / self.distance_thresh) * 0.5))
+                clear_winner = len(ranked) == 1 or best_dist + MARGIN < ranked[1][0]
+                if best_dist <= self.distance_thresh and clear_winner:
+                    faces.append({
+                        "result": "recognized",
+                        "box": box,
+                        "name": _display_name(identity),
+                        "confidence": sim,
+                        "matchId": best_idx,
+                    })
+                else:
+                    faces.append({
+                        "result": "unknown",
+                        "box": box,
+                        "name": "Unknown",
+                        "confidence": sim,
+                        "matchId": -1,
+                    })
 
-            if best_dist <= self.distance_thresh:
-                return {
-                    "result": "recognized",
-                    "faceDetected": True,
-                    "faceQuality": "READY",
-                    "box": box,
-                    "inferenceMs": infer_ms,
-                    "name": self.known_names[best_idx],
-                    "confidence": sim,
-                    "matchId": best_idx,
-                }
-            else:
-                return {
-                    "result": "unknown",
-                    "faceDetected": True,
-                    "faceQuality": "READY",
-                    "box": box,
-                    "inferenceMs": infer_ms,
-                    "name": "Unknown",
-                    "confidence": sim,
-                    "matchId": -1,
-                }
+        primary = next((face for face in faces if face["result"] == "recognized"), faces[0])
+        verdict = {
+            "result": primary["result"],
+            "faceDetected": True,
+            "faceQuality": "READY",
+            "box": primary["box"],
+            "faces": faces,
+            "inferenceMs": infer_ms,
+            "name": primary["name"],
+            "confidence": primary["confidence"],
+            "matchId": primary["matchId"],
+        }
+        if primary.get("unregistered"):
+            verdict["unregistered"] = True
+        return verdict
 
     def analyze_jpeg(self, jpeg):
         image = decode_jpeg(jpeg)
@@ -214,6 +275,7 @@ class FastFaceEngine:
 def run_face_worker(connection, faces_dir, threshold):
     # The preview process handles Ctrl+C and closes the pipe on exit.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    cv2.setNumThreads(1)
     with connection:
         try:
             engine = FastFaceEngine(faces_dir, distance_thresh=threshold)
@@ -445,8 +507,13 @@ class LaptopFaceBridge:
             interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
             cv2.resize(bgr_img, (video_w, video_h), dst=video, interpolation=interpolation)
 
-            box = verdict.get("box")
-            if verdict.get("faceDetected") and box is not None and len(box) == 4:
+            faces = verdict.get("faces")
+            if not faces and verdict.get("faceDetected") and verdict.get("box") is not None:
+                faces = [verdict]
+            for face in faces or ():
+                box = face.get("box")
+                if box is None or len(box) != 4:
+                    continue
                 x1, y1, x2, y2 = (
                     round(box[0] * video_w / source_w), round(box[1] * video_h / source_h),
                     round(box[2] * video_w / source_w), round(box[3] * video_h / source_h),
@@ -454,10 +521,10 @@ class LaptopFaceBridge:
                 x1, x2 = max(0, x1), min(video_w - 1, x2)
                 y1, y2 = max(0, y1), min(video_h - 1, y2)
                 if x2 > x1 and y2 > y1:
-                    result = verdict.get("result")
+                    result = face.get("result")
                     if result == "recognized":
                         color = teal
-                        tag = f"{verdict.get('name', 'Recognized')}  {verdict.get('confidence', 0):.0%}"
+                        tag = f"{face.get('name', 'Recognized')}  {face.get('confidence', 0):.0%}"
                     elif result == "unknown":
                         color, tag = (113, 128, 255), "Unknown face"
                     else:
@@ -493,6 +560,7 @@ class LaptopFaceBridge:
     def _preview_loop(self):
         window = "Smart Home Face Recognition - Camera 1"
         size = (960, 720)
+        cv2.setNumThreads(1)
         cv2.namedWindow(window, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
         cv2.resizeWindow(window, *size)
         cv2.imshow(window, self.draw_hud(None, {}, 0.0, size))
@@ -625,8 +693,8 @@ def main():
                         help="Set JPEG compression. Higher numbers send smaller frames")
     parser.add_argument("--faces-dir", default=os.path.join(os.path.dirname(__file__), "known_faces"),
                         help="Directory containing <Name>.jpg photos of authorized persons")
-    parser.add_argument("--thresh", type=float, default=0.58,
-                        help="Euclidean face distance threshold (default: 0.58, lower=stricter)")
+    parser.add_argument("--thresh", type=float, default=DEFAULT_TOLERANCE,
+                        help=f"Euclidean face distance threshold (default: {DEFAULT_TOLERANCE}, lower=stricter)")
     parser.add_argument("--no-gui", action="store_true", help="Run in headless background mode without OpenCV window")
     add_light_argument(parser)
     args = parser.parse_args()

@@ -133,7 +133,7 @@ Connect Windows to **SmartHome-Net** and open **http://192.168.4.1**. Close any 
 & $facePython tools\laptop_face_bridge.py --uart-port COM5 --resolution qvga --jpeg-quality 16
 ```
 
-Press **E** in the preview to enroll a face. Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop.
+Press **E** in the preview to enroll a face (saved as `tools/known_faces/<name>-<n>.jpg` and grouped automatically per identity). Use `--resolution hvga` or `--resolution vga` if the tested cable profile sustains it. For headless operation, add `--no-gui`. If the hub and laptop are on your home network, pass the hub's home-network IP with `--hub`. Open the dashboard from the same network as the laptop.
 
 The laptop preview shows **RX FPS** for valid frames arriving over serial, **Preview FPS** for frames drawn in the window, and **AI FPS** for completed recognition passes. The model runs in a separate process and takes the newest frame when ready. The preview and dashboard keep using new frames while the model works. If RX FPS is low, close the bridge and measure the serial feed on its own with `& $facePython tools\usb_camera_preview.py --port COM5 --uart --resolution qvga --no-gui --frames 300`.
 
