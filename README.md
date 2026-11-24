@@ -112,10 +112,9 @@ In VS Code, open **PlatformIO → Project Tasks**. For the hub, select **esp32de
 
 | UART upload profile | LED data pin |
 | --- | --- |
-| `cam_face_stream_s3_uart_led38` | GPIO38 |
 | `cam_face_stream_s3_uart_led48` | GPIO48 |
 
-Both profiles start white illumination at level 32 out of 255 when the updated laptop preview or face bridge starts streaming. The generic `cam_face_stream_s3_standalone_uart` profile uses an explicit `--light GPIO LEVEL` option.
+This profile starts white illumination at full brightness (level 255 out of 255) when the updated laptop preview or face bridge starts streaming. The generic `cam_face_stream_s3_standalone_uart` profile uses an explicit `--light GPIO LEVEL` option.
 
 Set up the laptop Python environment in PowerShell. In the preview commands below, replace `COM5` with the CH340 port from Device Manager.
 

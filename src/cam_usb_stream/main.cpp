@@ -17,7 +17,7 @@ constexpr int kDefaultQuality = 16;
 constexpr uint32_t kLightTimeoutMs = 4000;
 #if defined(CAMERA_UART_LIGHT_PIN)
 constexpr int kProfileLightPin = CAMERA_UART_LIGHT_PIN;
-constexpr int kProfileWhiteLevel = 32;
+constexpr int kProfileWhiteLevel = 255;
 static_assert(kProfileLightPin == 38 || kProfileLightPin == 48,
               "The camera light profile must use GPIO38 or GPIO48");
 #else
