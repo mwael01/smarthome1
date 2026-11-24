@@ -91,8 +91,12 @@ constexpr int ULTRASONIC_CONFIRM_READS         = 2;
 constexpr unsigned long ULTRASONIC_ALARM_HOLD_MS = 3000;
 constexpr unsigned long LAPTOP_TIMEOUT_MS = 6500;
 constexpr unsigned long MQ2_SAMPLE_INTERVAL_MS = 100;
-constexpr int MQ2_DEFAULT_THRESHOLD_MV = 1200;
+constexpr int MQ2_DEFAULT_THRESHOLD_MV = 2500;
+constexpr int MQ2_MIN_THRESHOLD_MV = 150;
+constexpr int MQ2_MAX_THRESHOLD_MV = 2500;
+constexpr int MQ2_PREVIOUS_DEFAULT_THRESHOLD_MV = 1200;
 constexpr int MQ2_HYSTERESIS_MV = 50;
+constexpr char MQ2_THRESHOLD_KEY[] = "smk_mv_v2";
 
 // ---------------------------------------------------------------------------
 // RFID Reader (MFRC522 / RC522) on SPI — non-conflicting pins for the Hub
@@ -128,7 +132,7 @@ struct HubConfig {
   bool ultraTriggersSiren  = true;  // Trigger buzzer on ultrasonic proximity
   bool sirenMuted          = false; // Global siren mute switch
   bool fireActiveLow       = true;  // Digital DO active level (LOW = Flame, HIGH = Clean)
-  int smokeThresholdMv    = MQ2_DEFAULT_THRESHOLD_MV;  // At GPIO35 after the divider
+  int smokeThresholdMv    = MQ2_DEFAULT_THRESHOLD_MV;  // At GPIO35
   bool voiceSpokenEnabled  = true;  // Natural spoken voice sentences vs musical chimes
   float ultrasonicDistCm   = 25.0f; // Proximity trigger threshold
   unsigned long gateHoldMs = 8000;  // Duration gate stays open after authorized RFID
@@ -409,7 +413,14 @@ void loadConfigFromNvs() {
   g_cfg.fireTriggersSiren    = prefs.getBool("fire_siren", true);
   g_cfg.smokeTriggersSiren   = prefs.getBool("smk_siren", true);
   g_cfg.fireActiveLow        = prefs.getBool("fire_actlow", true);
-  g_cfg.smokeThresholdMv     = constrain(prefs.getInt("smk_mv", MQ2_DEFAULT_THRESHOLD_MV), 150, 2300);
+  int smokeThreshold = prefs.getInt(MQ2_THRESHOLD_KEY, 0);
+  if (smokeThreshold == 0) {
+    // A separate key lets users save 1200 mV again after migrating the old default.
+    int previousThreshold = prefs.getInt("smk_mv", MQ2_PREVIOUS_DEFAULT_THRESHOLD_MV);
+    smokeThreshold = previousThreshold == MQ2_PREVIOUS_DEFAULT_THRESHOLD_MV
+                       ? MQ2_DEFAULT_THRESHOLD_MV : previousThreshold;
+  }
+  g_cfg.smokeThresholdMv = constrain(smokeThreshold, MQ2_MIN_THRESHOLD_MV, MQ2_MAX_THRESHOLD_MV);
   g_cfg.voiceSpokenEnabled   = prefs.getBool("v_spoken", true);
   g_cfg.ultrasonicDistCm     = prefs.getFloat("ultra_cm", 25.0f);
   g_cfg.gateHoldMs           = prefs.getULong("gate_ms", 8000);
@@ -447,7 +458,7 @@ void saveConfigToNvs() {
   prefs.putBool("fire_siren", g_cfg.fireTriggersSiren);
   prefs.putBool("smk_siren", g_cfg.smokeTriggersSiren);
   prefs.putBool("fire_actlow", g_cfg.fireActiveLow);
-  prefs.putInt("smk_mv", g_cfg.smokeThresholdMv);
+  prefs.putInt(MQ2_THRESHOLD_KEY, g_cfg.smokeThresholdMv);
   prefs.putBool("v_spoken", g_cfg.voiceSpokenEnabled);
   prefs.putFloat("ultra_cm", g_cfg.ultrasonicDistCm);
   prefs.putULong("gate_ms", g_cfg.gateHoldMs);
@@ -1212,8 +1223,8 @@ void handleApiTime() {
 void handleApiConfig() {
   if (server.hasArg("smoke_mv")) {
     long threshold;
-    if (!readIntegerArg("smoke_mv", 150, 2300, threshold)) {
-      server.send(400, "application/json", "{\"error\":\"MQ-2 threshold must be 150–2300 mV\"}");
+    if (!readIntegerArg("smoke_mv", MQ2_MIN_THRESHOLD_MV, MQ2_MAX_THRESHOLD_MV, threshold)) {
+      server.send(400, "application/json", "{\"error\":\"MQ-2 threshold must be 150–2500 mV\"}");
       return;
     }
     g_cfg.smokeThresholdMv = threshold;
@@ -1662,7 +1673,7 @@ void handleRoot() {
         </div>
         <div class="form-row">
           <label for="cfgSmokeMv">MQ-2 alarm threshold at GPIO35 (mV)</label>
-          <input id="cfgSmokeMv" type="number" min="150" max="2300" step="1">
+          <input id="cfgSmokeMv" type="number" min="150" max="2500" step="1">
         </div>
         <div class="form-row">
           <span>Ultrasonic Proximity Distance (cm)</span>

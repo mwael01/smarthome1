@@ -7,7 +7,7 @@ A PlatformIO smart home system with an **ESP32 Hub**, an **ESP32-S3 camera**, an
 ## System Architecture
 
 1. **Main Hub (`[env:esp32dev]`, [`src/main.cpp`](src/main.cpp))**
-   - **Safety Sensors**: Digital Flame IR (`DO` → `GPIO34`), analog Smoke/Gas MQ-2 (`AO` → divider → `GPIO35`), PIR Motion (`GPIO27`), and HC-SR04 Ultrasonic (`TRIG=GPIO32`, `ECHO=GPIO33`, `<= 25.0 cm`) → sweeping **Siren Buzzer (`GPIO25`)**.
+   - **Safety Sensors** include digital Flame IR (`DO` → `GPIO34`), analog Smoke/Gas MQ-2 (`AO` → `GPIO35`), PIR Motion (`GPIO27`), and HC-SR04 Ultrasonic (`TRIG=GPIO32`, `ECHO=GPIO33`, `<= 25.0 cm`) with a sweeping **siren buzzer (`GPIO25`)**.
    - **Per-Sensor Alarm Bypass / Ignore**: Dedicated 1-click toggles and NVS settings allow bypassing/muting the siren trigger for individual sensors (e.g. ignore MQ-2 or Flame sensor alarm) while keeping real-time visual telemetry active and other alarms fully armed.
    - **PIR Scheduled Night Guard**: Restricts the loud siren activation on motion to the overnight window between **Midnight (00:00) and 7:00 AM (07:00)**; movement during the day displays in the UI but remains silent.
    - **Smart Lighting Controller (`GPIO21`)**: 3.3V digital output driving a relay module or MOSFET circuit with dashboard controls, automated event logging, and voice feedback.
@@ -38,7 +38,7 @@ A PlatformIO smart home system with an **ESP32 Hub**, an **ESP32-S3 camera**, an
 - **CH340 USB-to-UART programmer** for camera flashing and live streaming, with 3.3 V logic on TX/RX.
 - **Sensors & Actuators on Main Hub**:
   - Digital IR Flame Sensor (`DO` → `GPIO34`)
-  - Analog MQ-2 Smoke / Gas Sensor (`AO` → divider → `GPIO35`)
+  - Analog MQ-2 Smoke / Gas Sensor (`AO` → `GPIO35` on the measured 3 V-powered setup)
   - PIR Motion Sensor (`OUT` → `GPIO27`)
   - HC-SR04 Ultrasonic Sensor (`TRIG` → `GPIO32`, `ECHO` → `GPIO33` via 5 V → 3.3 V resistor divider)
   - Passive Piezo Buzzer (`SIG` → `GPIO25`)
@@ -57,7 +57,7 @@ A PlatformIO smart home system with an **ESP32 Hub**, an **ESP32-S3 camera**, an
 | **HW-104 Spoken Voice Speaker** | `L / R` (Audio In) | `GPIO4` | LEDC 312.5 kHz PWM (8-bit, Timer 3 Ch 6) | PAM8403 2×3W Class-D amplifier; non-blocking FreeRTOS natural spoken sentences & dual siren alarms |
 | **INMP441 I2S Microphone** | `SCK` (BCLK)<br>`WS` (LRCLK)<br>`SD` (Data)<br>`L/R` (Channel)<br>`VDD` | `GPIO17`<br>`GPIO16`<br>`GPIO23`<br>`GND`<br>`3V3` | Hardware I2S (`I2S_NUM_0`) | 16 kHz Master RX digital microphone; VDD connects strictly to 3.3V (NOT 5V) |
 | **Flame Sensor** | `DO` | `GPIO34` | Digital Input (`INPUT`) | Active-LOW (0V = Flame, 3.3V = Safe); potentiometer calibrated on module; siren trigger can be ignored via dashboard |
-| **MQ-2 Smoke Sensor** | `AO` | `GPIO35` | ADC1, 11 dB attenuation | Divide the module output before connecting it to GPIO35. Set the alarm threshold in mV in the dashboard. |
+| **MQ-2 Smoke Sensor** | `AO` | `GPIO35` | ADC1, 11 dB attenuation | The measured 3 V-powered setup uses a 2500 mV default threshold. |
 | **PIR Motion Sensor** | `OUT` | `GPIO27` | `INPUT_PULLDOWN` | Active `HIGH` (`3.3 V` logic); siren only activates during night window (**Midnight–7 AM**) |
 | **Ultrasonic Sensor** | `TRIG` | `GPIO32` | Digital Output | 10 µs trigger pulse every `60 ms` (`<= 25.0 cm` triggers siren) |
 | **Ultrasonic Sensor** | `ECHO` | `GPIO33` | Digital Input | **Use 5 V → 3.3 V voltage divider** |
@@ -69,7 +69,7 @@ A PlatformIO smart home system with an **ESP32 Hub**, an **ESP32-S3 camera**, an
 
 For the **face door servo**, move its signal wire to main ESP32 **GPIO26**. Connect servo power to a supply rated for the motors' voltage and stall current. Connect the servo supply ground to the main ESP32 ground.
 
-For a **5 V MQ-2 module**, connect module `VCC` to the rated 5 V supply and share its ground with the hub. Wire `AO` through **12 kΩ** to the GPIO35 junction, and **10 kΩ** from that junction to ground. A 5 V output becomes about 2.27 V at GPIO35. Leave `DO` disconnected. After sensor warm-up, use the dashboard reading to set a site-specific threshold above the clean-air baseline. The initial **1200 mV** setting is measured at GPIO35. The project reports voltage and has no gas concentration calibration. [Winsen MQ-2 datasheet](https://www.winsen-sensor.com/d/files/MQ-2.pdf) · [Espressif ADC documentation](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/adc.html)
+For the measured **3 V-powered MQ-2 module**, connect `AO` directly to main ESP32 `GPIO35`, share ground, and leave `DO` disconnected. The default alarm threshold is **2500 mV** at GPIO35, based on a smoke reading of about 3000 mV on this setup. The firmware migrates saved 1200 mV thresholds from earlier builds and preserves other saved values. Keep `AO` within the ESP32 input rating. Winsen specifies 5 V for the bare MQ-2 heater, so verify each module's response at the supply voltage used. [Winsen MQ-2 datasheet](https://www.winsen-sensor.com/d/files/manual/mq-2.pdf?v=1.0.24) · [Espressif ADC documentation](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/adc.html)
 
 ### ESP32-S3 camera to laptop via CH340
 
